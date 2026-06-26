@@ -16,11 +16,7 @@ app.use(express.json({ limit: '10mb' }));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500 });
 app.use(limiter);
 
-app.get('/health', (req, res) => res.json({ 
-  ok: true, 
-  status: 'CENSE-VR API rodando', 
-  timestamp: new Date().toISOString() 
-}));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API rodando', timestamp: new Date().toISOString() }));
 
 app.post('/api/login', login);
 
@@ -38,7 +34,7 @@ async function iniciar() {
   try {
     await inicializarBanco();
     app.listen(PORT, () => {
-      console.log(`✅ CENSE-VR API rodando na porta ${PORT}`);
+      console.log('✅ CENSE-VR API rodando na porta ' + PORT);
     });
   } catch (err) {
     console.error('❌ Erro ao iniciar:', err);
