@@ -21,23 +21,23 @@ app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API roda
 app.post('/api/login', login);
 
 const auth = autenticar;
-app.use('/api/usuarios',      auth, require('./rotas/usuarios'));
-app.use('/api/adolescentes',  auth, require('./rotas/adolescentes'));
-app.use('/api/frequencia',    auth, require('./rotas/frequencia'));
-app.use('/api/agenda',        auth, require('./rotas/agenda'));
-app.use('/api/almoxarifado',  auth, require('./rotas/almoxarifado'));
-app.use('/api/rios',          auth, require('./rotas/rios'));
-app.use('/api/plantao',       auth, require('./rotas/plantao'));
-app.use('/api/config',        auth, require('./rotas/config'));
+app.use('/api/usuarios',      auth, require('./usuarios'));
+app.use('/api/adolescentes',  auth, require('./adolescentes'));
+app.use('/api/frequencia',    auth, require('./frequencia'));
+app.use('/api/agenda',        auth, require('./agenda'));
+app.use('/api/almoxarifado',  auth, require('./almoxarifado'));
+app.use('/api/rios',          auth, require('./rios'));
+app.use('/api/plantao',       auth, require('./plantao'));
+app.use('/api/config',        auth, require('./config'));
 
 async function iniciar() {
   try {
     await inicializarBanco();
     app.listen(PORT, () => {
-      console.log('✅ CENSE-VR API rodando na porta ' + PORT);
+      console.log('CENSE-VR API rodando na porta ' + PORT);
     });
   } catch (err) {
-    console.error('❌ Erro ao iniciar:', err);
+    console.error('Erro ao iniciar:', err);
     process.exit(1);
   }
 }
