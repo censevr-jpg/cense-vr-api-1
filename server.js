@@ -6,21 +6,33 @@ const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
- 
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cense_vr_secret_2025';
- 
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
- 
+
 app.use(helmet({ contentSecurityPolicy: false }));
+
+// Helper para datas
+function parseDate(d){
+  if(!d||d===''||d==='null'||d==='undefined') return null;
+  if(typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  if(typeof d==='string'&&/^\d{2}\/\d{2}\/\d{2,4}$/.test(d)){
+    const p=d.split('/');
+    const ano=p[2].length===2?'20'+p[2]:p[2];
+    return ano+'-'+p[1]+'-'+p[0];
+  }
+  return null;
+}
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'] }));
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
- 
+
 // ===== BANCO =====
 async function initDB() {
   await pool.query(`
@@ -117,7 +129,7 @@ async function initDB() {
   }
   console.log('Banco inicializado!');
 }
- 
+
 // ===== AUTH =====
 function auth(req, res, next) {
   const h = req.headers.authorization;
@@ -125,9 +137,9 @@ function auth(req, res, next) {
   try { req.usuario = jwt.verify(h.slice(7), JWT_SECRET); next(); }
   catch { res.status(401).json({ ok: false, erro: 'Token invalido' }); }
 }
- 
+
 app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date() }));
- 
+
 app.post('/api/login', async (req, res) => {
   const { nome, senha } = req.body;
   try {
@@ -140,7 +152,7 @@ app.post('/api/login', async (req, res) => {
     res.json({ ok: true, token, usuario: { id: u.id, nome: u.nome, perfil: u.perfil } });
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
- 
+
 // ===== USUARIOS =====
 app.get('/api/usuarios', auth, async (req,res) => {
   const r = await pool.query('SELECT id,nome,perfil,ativo FROM usuarios ORDER BY nome');
@@ -166,7 +178,7 @@ app.delete('/api/usuarios/:id', auth, async (req,res) => {
   await pool.query('UPDATE usuarios SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
- 
+
 // ===== CONFIG =====
 app.get('/api/config/modulos', auth, async (req,res) => {
   const r = await pool.query('SELECT m.*,COUNT(a.id) FILTER(WHERE a.situacao=\'ativo\') as total FROM modulos m LEFT JOIN adolescentes a ON a.modulo_id=m.id WHERE m.ativo=true GROUP BY m.id ORDER BY m.nome');
@@ -216,7 +228,7 @@ app.delete('/api/config/produtos/:id', auth, async (req,res) => {
   await pool.query('UPDATE produtos SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
- 
+
 // ===== ADOLESCENTES =====
 app.get('/api/adolescentes', auth, async (req,res) => {
   const r = await pool.query('SELECT a.*,m.nome as modulo_nome,t.nome as turma_nome,e.nome as escola_nome FROM adolescentes a LEFT JOIN modulos m ON a.modulo_id=m.id LEFT JOIN turmas t ON a.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id ORDER BY a.nome');
@@ -224,12 +236,12 @@ app.get('/api/adolescentes', auth, async (req,res) => {
 });
 app.post('/api/adolescentes', auth, async (req,res) => {
   const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv } = req.body;
-  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[nome,prontuario||null,nascimento||null,modulo_id||null,turma_id||null,cidade||null,entrada||null,situacao||'ativo',tv||false]);
+  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/adolescentes/:id', auth, async (req,res) => {
   const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv } = req.body;
-  const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,atualizado_em=NOW() WHERE id=$10 RETURNING *',[nome,prontuario||null,nascimento||null,modulo_id||null,turma_id||null,cidade||null,entrada||null,situacao||'ativo',tv||false,req.params.id]);
+  const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,atualizado_em=NOW() WHERE id=$10 RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,req.params.id]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.delete('/api/adolescentes/:id', auth, async (req,res) => {
@@ -244,7 +256,7 @@ app.get('/api/adolescentes/:id/rios', auth, async (req,res) => {
   const r = await pool.query('SELECT r.* FROM rios r JOIN rio_adolescentes ra ON r.id=ra.rio_id WHERE ra.adolescente_id=$1 ORDER BY r.data DESC',[req.params.id]);
   res.json({ ok:true, dados:r.rows });
 });
- 
+
 // ===== FREQUÊNCIA =====
 app.get('/api/frequencia/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT f.*,a.nome as adolescente_nome,a.prontuario,t.nome as turma_nome,e.nome as escola_nome,m.nome as modulo_nome FROM frequencia f JOIN adolescentes a ON f.adolescente_id=a.id LEFT JOIN turmas t ON f.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id LEFT JOIN modulos m ON a.modulo_id=m.id WHERE f.data=$1 ORDER BY e.nome,t.nome,a.nome',[req.params.data]);
@@ -274,7 +286,7 @@ app.post('/api/frequencia/cancelar-turma', auth, async (req,res) => {
   }
   res.json({ ok:true, total:alunos.rows.length });
 });
- 
+
 // ===== AGENDA =====
 app.get('/api/agenda/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT a.*,COALESCE(json_agg(json_build_object(\'id\',ad.id,\'nome\',ad.nome)) FILTER(WHERE ad.id IS NOT NULL),\'[]\') as adolescentes FROM agenda a LEFT JOIN agenda_adolescentes aa ON a.id=aa.agenda_id LEFT JOIN adolescentes ad ON aa.adolescente_id=ad.id WHERE a.data=$1 GROUP BY a.id ORDER BY a.hora',[req.params.data]);
@@ -298,7 +310,7 @@ app.delete('/api/agenda/:id', auth, async (req,res) => {
   await pool.query('DELETE FROM agenda WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
- 
+
 // ===== ALMOXARIFADO =====
 app.get('/api/almoxarifado/entregas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM entregas WHERE data=$1 ORDER BY hora DESC',[req.params.data]);
@@ -313,7 +325,7 @@ app.post('/api/almoxarifado/entregas', auth, async (req,res) => {
   }
   res.json({ ok:true, dados:inseridos });
 });
- 
+
 // ===== RIOs =====
 app.get('/api/rios', auth, async (req,res) => {
   const r = await pool.query('SELECT ri.*,COALESCE(json_agg(json_build_object(\'id\',a.id,\'nome\',a.nome)) FILTER(WHERE a.id IS NOT NULL),\'[]\') as adolescentes FROM rios ri LEFT JOIN rio_adolescentes ra ON ri.id=ra.rio_id LEFT JOIN adolescentes a ON ra.adolescente_id=a.id GROUP BY ri.id ORDER BY ri.criado_em DESC');
@@ -343,7 +355,7 @@ app.delete('/api/rios/:id', auth, async (req,res) => {
   await pool.query('DELETE FROM rios WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
- 
+
 // ===== PLANTÃO =====
 app.post('/api/plantao/troca', auth, async (req,res) => {
   const { adolescente_id,modulo_destino_id,modulo_origem,modulo_destino,motivo,agente,observacao,data } = req.body;
@@ -361,9 +373,8 @@ app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
 });
- 
+
 // ===== INICIAR =====
 initDB().then(() => {
   app.listen(PORT, () => console.log('CENSE-VR API porta ' + PORT));
 }).catch(err => { console.error(err); process.exit(1); });
- 
