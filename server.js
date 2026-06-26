@@ -21,14 +21,22 @@ app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API roda
 app.post('/api/login', login);
 
 const auth = autenticar;
-app.use('/api/usuarios',      auth, require('./usuarios'));
-app.use('/api/adolescentes',  auth, require('./adolescentes'));
-app.use('/api/frequencia',    auth, require('./frequencia'));
-app.use('/api/agenda',        auth, require('./agenda'));
-app.use('/api/almoxarifado',  auth, require('./almoxarifado'));
-app.use('/api/rios',          auth, require('./rios'));
-app.use('/api/plantao',       auth, require('./plantao'));
-app.use('/api/config',        auth, require('./config'));
+
+const fs = require('fs');
+const path = require('path');
+
+// Detectar nome correto da pasta de rotas
+const rotasDir = fs.existsSync(path.join(__dirname, 'rotas')) ? './rotas' : 
+                 fs.existsSync(path.join(__dirname, 'Rotas')) ? './Rotas' : './rotas';
+
+app.use('/api/usuarios',      auth, require(rotasDir + '/usuarios'));
+app.use('/api/adolescentes',  auth, require(rotasDir + '/adolescentes'));
+app.use('/api/frequencia',    auth, require(rotasDir + '/frequencia'));
+app.use('/api/agenda',        auth, require(rotasDir + '/agenda'));
+app.use('/api/almoxarifado',  auth, require(rotasDir + '/almoxarifado'));
+app.use('/api/rios',          auth, require(rotasDir + '/rios'));
+app.use('/api/plantao',       auth, require(rotasDir + '/plantao'));
+app.use('/api/config',        auth, require(rotasDir + '/config'));
 
 async function iniciar() {
   try {
