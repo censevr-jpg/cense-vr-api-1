@@ -16,19 +16,23 @@ app.use(express.json({ limit: '10mb' }));
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500 });
 app.use(limiter);
 
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API rodando', timestamp: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ 
+  ok: true, 
+  status: 'CENSE-VR API rodando', 
+  timestamp: new Date().toISOString() 
+}));
 
 app.post('/api/login', login);
 
 const auth = autenticar;
-app.use('/api/usuarios',      auth, require('./Rotas/usuarios'));
-app.use('/api/adolescentes',  auth, require('./Rotas/adolescentes'));
-app.use('/api/frequencia',    auth, require('./Rotas/frequencia'));
-app.use('/api/agenda',        auth, require('./Rotas/agenda'));
-app.use('/api/almoxarifado',  auth, require('./Rotas/almoxarifado'));
-app.use('/api/rios',          auth, require('./Rotas/rios'));
-app.use('/api/plantao',       auth, require('./Rotas/plantao'));
-app.use('/api/config',        auth, require('./Rotas/config'));
+app.use('/api/usuarios',      auth, require('./rotas/usuarios'));
+app.use('/api/adolescentes',  auth, require('./rotas/adolescentes'));
+app.use('/api/frequencia',    auth, require('./rotas/frequencia'));
+app.use('/api/agenda',        auth, require('./rotas/agenda'));
+app.use('/api/almoxarifado',  auth, require('./rotas/almoxarifado'));
+app.use('/api/rios',          auth, require('./rotas/rios'));
+app.use('/api/plantao',       auth, require('./rotas/plantao'));
+app.use('/api/config',        auth, require('./rotas/config'));
 
 async function iniciar() {
   try {
