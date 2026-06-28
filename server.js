@@ -248,6 +248,18 @@ app.delete('/api/adolescentes/:id', auth, async (req,res) => {
   await pool.query("UPDATE adolescentes SET situacao='desligado' WHERE id=$1",[req.params.id]);
   res.json({ ok:true });
 });
+app.delete('/api/adolescentes/duplicados/remover', auth, async (req,res) => {
+  try{
+    const r = await pool.query('SELECT id, UPPER(TRIM(nome)) as nome_upper FROM adolescentes ORDER BY id');
+    const porNome = {};
+    r.rows.forEach(a=>{ if(!porNome[a.nome_upper]) porNome[a.nome_upper]=[]; porNome[a.nome_upper].push(a.id); });
+    const remover = [];
+    Object.values(porNome).forEach(ids=>{ if(ids.length>1) remover.push(...ids.slice(1)); });
+    if(!remover.length) return res.json({ok:true, removidos:0, msg:'Nenhum duplicado'});
+    await pool.query('DELETE FROM adolescentes WHERE id = ANY($1)', [remover]);
+    res.json({ok:true, removidos:remover.length});
+  }catch(e){ res.status(500).json({ok:false, erro:e.message}); }
+});
 app.get('/api/adolescentes/:id/historico', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM historico_alojamentos WHERE adolescente_id=$1 ORDER BY criado_em DESC',[req.params.id]);
   res.json({ ok:true, dados:r.rows });
