@@ -140,6 +140,16 @@ function auth(req, res, next) {
 
 app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date() }));
 
+// Rota de migração - adiciona coluna alojamento se não existir
+app.get('/migrate', async (req, res) => {
+  try {
+    await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
+    res.json({ ok: true, msg: 'Migração concluída - coluna alojamento adicionada' });
+  } catch(e) {
+    res.json({ ok: false, erro: e.message });
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   const { nome, senha } = req.body;
   try {
