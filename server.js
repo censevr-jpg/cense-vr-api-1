@@ -173,6 +173,81 @@ app.get('/migrate', async (req, res) => {
   }
 });
 
+// Rota de migração de DADOS - copia tudo do banco antigo (Render) para o novo (Supabase)
+app.get('/migrate-data-render-to-supabase', async (req, res) => {
+  if (!process.env.DATABASE_URL_SUPABASE) {
+    return res.json({ ok: false, erro: 'DATABASE_URL_SUPABASE não configurada' });
+  }
+  if (!process.env.DATABASE_URL_OLD_RENDER) {
+    return res.json({ ok: false, erro: 'DATABASE_URL_OLD_RENDER não configurada. Adicione essa variável com a string antiga do Render.' });
+  }
+
+  const poolOrigem = new Pool({
+    connectionString: process.env.DATABASE_URL_OLD_RENDER,
+    ssl: { rejectUnauthorized: false }
+  });
+  const poolDestino = new Pool({
+    connectionString: process.env.DATABASE_URL_SUPABASE,
+    ssl: { rejectUnauthorized: false }
+  });
+
+  const resultado = {};
+  const tabelas = [
+    'usuarios', 'modulos', 'escolas', 'turmas', 'adolescentes',
+    'historico_alojamentos', 'frequencia', 'controle_aula', 'cancelamento_turma',
+    'agenda', 'agenda_adolescentes', 'produtos', 'entregas', 'rios',
+    'rio_adolescentes', 'log_acesso', 'atendimentos'
+  ];
+
+  try {
+    for (const tabela of tabelas) {
+      try {
+        const origem = await poolOrigem.query(`SELECT * FROM ${tabela}`);
+        if (origem.rows.length === 0) {
+          resultado[tabela] = 'vazio (0 linhas)';
+          continue;
+        }
+
+        await poolDestino.query(`DELETE FROM ${tabela}`);
+
+        const colunas = Object.keys(origem.rows[0]);
+        let inseridos = 0;
+        for (const row of origem.rows) {
+          const valores = colunas.map(c => row[c]);
+          const placeholders = colunas.map((_, i) => `$${i + 1}`).join(',');
+          const colunasStr = colunas.join(',');
+          try {
+            await poolDestino.query(
+              `INSERT INTO ${tabela} (${colunasStr}) VALUES (${placeholders})`,
+              valores
+            );
+            inseridos++;
+          } catch (e) {
+            // Ignora erros de linha individual e segue
+          }
+        }
+        resultado[tabela] = `${inseridos}/${origem.rows.length} copiados`;
+
+        try {
+          await poolDestino.query(
+            `SELECT setval(pg_get_serial_sequence('${tabela}', 'id'), COALESCE((SELECT MAX(id) FROM ${tabela}), 1))`
+          );
+        } catch (e) {}
+
+      } catch (e) {
+        resultado[tabela] = 'ERRO: ' + e.message;
+      }
+    }
+
+    res.json({ ok: true, resultado });
+  } catch (e) {
+    res.json({ ok: false, erro: e.message });
+  } finally {
+    await poolOrigem.end();
+    await poolDestino.end();
+  }
+});
+
 app.post('/api/login', async (req, res) => {
   const { nome, senha } = req.body;
   try {
