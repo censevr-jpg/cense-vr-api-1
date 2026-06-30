@@ -161,6 +161,7 @@ app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', ti
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
+    await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
     await pool.query(`CREATE TABLE IF NOT EXISTS atendimentos (
       id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
       adolescente_id INTEGER, adolescente_nome VARCHAR(200), data DATE NOT NULL,
@@ -249,36 +250,55 @@ app.get('/migrate-data-render-to-supabase', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  const { nome, senha } = req.body;
+  const { nome, senha, matricula } = req.body;
+  const login = matricula || nome; // aceita matricula (campo principal) ou nome (fallback p/ Gestor)
   try {
-    const r = await pool.query('SELECT * FROM usuarios WHERE LOWER(nome)=LOWER($1) AND ativo=true', [nome]);
+    const r = await pool.query(
+      'SELECT * FROM usuarios WHERE (matricula=$1 OR LOWER(nome)=LOWER($1)) AND ativo=true',
+      [login]
+    );
     if (!r.rows.length) return res.status(401).json({ ok: false, erro: 'Usuario ou senha incorretos' });
     const u = r.rows[0];
     if (!await bcrypt.compare(senha, u.senha_hash)) return res.status(401).json({ ok: false, erro: 'Usuario ou senha incorretos' });
     await pool.query('INSERT INTO log_acesso (usuario,acao) VALUES ($1,$2)', [u.nome, 'Login']);
     const token = jwt.sign({ id: u.id, nome: u.nome, perfil: u.perfil }, JWT_SECRET, { expiresIn: '12h' });
-    res.json({ ok: true, token, usuario: { id: u.id, nome: u.nome, perfil: u.perfil } });
+    res.json({ ok: true, token, usuario: { id: u.id, nome: u.nome, perfil: u.perfil, matricula: u.matricula } });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// Trocar a própria senha (qualquer usuário autenticado)
+app.put('/api/usuarios/trocar-senha', auth, async (req, res) => {
+  const { senhaAtual, senhaNova } = req.body;
+  if (!senhaAtual || !senhaNova) return res.status(400).json({ ok: false, erro: 'Preencha a senha atual e a nova senha.' });
+  try {
+    const r = await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.usuario.id]);
+    if (!r.rows.length) return res.status(404).json({ ok: false, erro: 'Usuário não encontrado.' });
+    const u = r.rows[0];
+    if (!await bcrypt.compare(senhaAtual, u.senha_hash)) return res.status(401).json({ ok: false, erro: 'Senha atual incorreta.' });
+    const novoHash = await bcrypt.hash(senhaNova, 10);
+    await pool.query('UPDATE usuarios SET senha_hash=$1 WHERE id=$2', [novoHash, req.usuario.id]);
+    res.json({ ok: true, msg: 'Senha alterada com sucesso!' });
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 // ===== USUARIOS =====
 app.get('/api/usuarios', auth, async (req,res) => {
-  const r = await pool.query('SELECT id,nome,perfil,ativo FROM usuarios ORDER BY nome');
+  const r = await pool.query('SELECT id,nome,perfil,matricula,ativo FROM usuarios ORDER BY nome');
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/usuarios', auth, async (req,res) => {
-  const { nome, senha, perfil } = req.body;
+  const { nome, senha, perfil, matricula } = req.body;
   const hash = await bcrypt.hash(senha, 10);
-  const r = await pool.query('INSERT INTO usuarios (nome,senha_hash,perfil) VALUES ($1,$2,$3) RETURNING id,nome,perfil', [nome,hash,perfil]);
+  const r = await pool.query('INSERT INTO usuarios (nome,senha_hash,perfil,matricula) VALUES ($1,$2,$3,$4) RETURNING id,nome,perfil,matricula', [nome,hash,perfil,matricula||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/usuarios/:id', auth, async (req,res) => {
-  const { nome, senha, perfil, ativo } = req.body;
+  const { nome, senha, perfil, ativo, matricula } = req.body;
   if (senha) {
     const hash = await bcrypt.hash(senha,10);
-    await pool.query('UPDATE usuarios SET nome=$1,senha_hash=$2,perfil=$3,ativo=$4 WHERE id=$5',[nome,hash,perfil,ativo!==false,req.params.id]);
+    await pool.query('UPDATE usuarios SET nome=$1,senha_hash=$2,perfil=$3,ativo=$4,matricula=$5 WHERE id=$6',[nome,hash,perfil,ativo!==false,matricula||null,req.params.id]);
   } else {
-    await pool.query('UPDATE usuarios SET nome=$1,perfil=$2,ativo=$3 WHERE id=$4',[nome,perfil,ativo!==false,req.params.id]);
+    await pool.query('UPDATE usuarios SET nome=$1,perfil=$2,ativo=$3,matricula=$4 WHERE id=$5',[nome,perfil,ativo!==false,matricula||null,req.params.id]);
   }
   res.json({ ok:true });
 });
