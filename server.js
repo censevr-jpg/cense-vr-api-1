@@ -11,8 +11,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cense_vr_secret_2025';
 
+// Usa Supabase se a variável estiver presente, senão usa o banco antigo (Render)
+const CONNECTION_STRING = process.env.DATABASE_URL_SUPABASE || process.env.DATABASE_URL;
+const USANDO_SUPABASE = !!process.env.DATABASE_URL_SUPABASE;
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: CONNECTION_STRING,
   ssl: { rejectUnauthorized: false }
 });
 
@@ -151,7 +155,7 @@ function auth(req, res, next) {
   catch { res.status(401).json({ ok: false, erro: 'Token invalido' }); }
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date() }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 // Rota de migração - adiciona coluna alojamento se não existir
 app.get('/migrate', async (req, res) => {
