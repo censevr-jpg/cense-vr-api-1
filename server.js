@@ -32,7 +32,7 @@ app.options('*', cors(corsOptions));
 // Helmet depois do CORS
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 10000, max: 10000 }));
 
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
