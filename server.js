@@ -120,6 +120,19 @@ async function initDB() {
       id SERIAL PRIMARY KEY, usuario VARCHAR(200), acao VARCHAR(100),
       criado_em TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS atendimentos (
+      id SERIAL PRIMARY KEY,
+      profissional VARCHAR(200) NOT NULL,
+      area VARCHAR(100),
+      adolescente_id INTEGER REFERENCES adolescentes(id),
+      adolescente_nome VARCHAR(200),
+      data DATE NOT NULL,
+      hora TIME,
+      tipo VARCHAR(200) NOT NULL,
+      saude_mental BOOLEAN DEFAULT false,
+      obs TEXT,
+      criado_em TIMESTAMP DEFAULT NOW()
+    );
   `);
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
   if (!existe.rows.length) {
@@ -144,7 +157,13 @@ app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', ti
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
-    res.json({ ok: true, msg: 'Migração concluída - coluna alojamento adicionada' });
+    await pool.query(`CREATE TABLE IF NOT EXISTS atendimentos (
+      id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
+      adolescente_id INTEGER, adolescente_nome VARCHAR(200), data DATE NOT NULL,
+      hora TIME, tipo VARCHAR(200) NOT NULL, saude_mental BOOLEAN DEFAULT false,
+      obs TEXT, criado_em TIMESTAMP DEFAULT NOW()
+    )`);
+    res.json({ ok: true, msg: 'Migração concluída!' });
   } catch(e) {
     res.json({ ok: false, erro: e.message });
   }
@@ -384,6 +403,50 @@ app.post('/api/plantao/troca', auth, async (req,res) => {
 app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
+});
+
+// ===== ATENDIMENTOS TÉCNICOS =====
+app.get('/api/atendimentos', auth, async (req,res) => {
+  try {
+    const { data, profissional } = req.query;
+    let q = 'SELECT * FROM atendimentos WHERE 1=1';
+    const params = [];
+    if(data){ params.push(data); q += ` AND data=$${params.length}`; }
+    if(profissional){ params.push(profissional); q += ` AND profissional=$${params.length}`; }
+    q += ' ORDER BY data DESC, hora DESC';
+    const r = await pool.query(q, params);
+    res.json({ ok:true, dados:r.rows });
+  } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.post('/api/atendimentos', auth, async (req,res) => {
+  try {
+    const { profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs } = req.body;
+    const r = await pool.query(
+      `INSERT INTO atendimentos (profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [profissional, area||null, adolescente_id||null, adolescente_nome||null, data, hora||null, tipo, saude_mental||false, obs||null]
+    );
+    res.json({ ok:true, dados:r.rows[0] });
+  } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/api/atendimentos/:id', auth, async (req,res) => {
+  try {
+    await pool.query('DELETE FROM atendimentos WHERE id=$1', [req.params.id]);
+    res.json({ ok:true });
+  } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.get('/api/atendimentos/periodo', auth, async (req,res) => {
+  try {
+    const { inicio, fim } = req.query;
+    const r = await pool.query(
+      'SELECT * FROM atendimentos WHERE data >= $1 AND data <= $2 ORDER BY profissional, data DESC',
+      [inicio, fim]
+    );
+    res.json({ ok:true, dados:r.rows });
+  } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ===== INICIAR =====
