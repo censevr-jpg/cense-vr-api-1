@@ -11,7 +11,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cense_vr_secret_2025';
 
-// Usa Supabase se a variável estiver presente, senão usa o banco antigo (Render)
 const CONNECTION_STRING = process.env.DATABASE_URL_SUPABASE || process.env.DATABASE_URL;
 const USANDO_SUPABASE = !!process.env.DATABASE_URL_SUPABASE;
 
@@ -20,9 +19,21 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-app.use(helmet({ contentSecurityPolicy: false }));
+// CORS PRIMEIRO - antes do helmet
+const corsOptions = {
+  origin: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
-// Helper para datas
+// Helmet depois do CORS
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: '10mb' }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
+
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
   if(typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
@@ -33,17 +44,7 @@ function parseDate(d){
   }
   return null;
 }
-app.use(cors({
-  origin: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  credentials: false
-}));
-app.options('*', cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 1000 }));
 
-// ===== BANCO =====
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -65,8 +66,8 @@ async function initDB() {
       id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL, prontuario VARCHAR(50),
       nascimento DATE, modulo_id INTEGER REFERENCES modulos(id),
       turma_id INTEGER REFERENCES turmas(id), cidade VARCHAR(100),
-      entrada DATE, situacao VARCHAR(30) DEFAULT 'ativo', tv BOOLEAN DEFAULT false, alojamento VARCHAR(20),
-      atualizado_em TIMESTAMP DEFAULT NOW()
+      entrada DATE, situacao VARCHAR(30) DEFAULT 'ativo', tv BOOLEAN DEFAULT false,
+      alojamento VARCHAR(20), atualizado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS historico_alojamentos (
       id SERIAL PRIMARY KEY, adolescente_id INTEGER REFERENCES adolescentes(id),
@@ -131,17 +132,11 @@ async function initDB() {
       criado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS atendimentos (
-      id SERIAL PRIMARY KEY,
-      profissional VARCHAR(200) NOT NULL,
-      area VARCHAR(100),
+      id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
       adolescente_id INTEGER REFERENCES adolescentes(id),
-      adolescente_nome VARCHAR(200),
-      data DATE NOT NULL,
-      hora TIME,
-      tipo VARCHAR(200) NOT NULL,
-      saude_mental BOOLEAN DEFAULT false,
-      obs TEXT,
-      criado_em TIMESTAMP DEFAULT NOW()
+      adolescente_nome VARCHAR(200), data DATE NOT NULL, hora TIME,
+      tipo VARCHAR(200) NOT NULL, saude_mental BOOLEAN DEFAULT false,
+      obs TEXT, criado_em TIMESTAMP DEFAULT NOW()
     );
   `);
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
@@ -153,7 +148,6 @@ async function initDB() {
   console.log('Banco inicializado!');
 }
 
-// ===== AUTH =====
 function auth(req, res, next) {
   const h = req.headers.authorization;
   if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ ok: false, erro: 'Nao autenticado' });
@@ -163,7 +157,6 @@ function auth(req, res, next) {
 
 app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
-// Rota de migração - adiciona coluna alojamento se não existir
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
@@ -174,95 +167,44 @@ app.get('/migrate', async (req, res) => {
       hora TIME, tipo VARCHAR(200) NOT NULL, saude_mental BOOLEAN DEFAULT false,
       obs TEXT, criado_em TIMESTAMP DEFAULT NOW()
     )`);
-    res.json({ ok: true, msg: 'Migração concluída!' });
-  } catch(e) {
-    res.json({ ok: false, erro: e.message });
-  }
+    res.json({ ok: true, msg: 'Migracao concluida!' });
+  } catch(e) { res.json({ ok: false, erro: e.message }); }
 });
 
-// Rota de migração de DADOS - copia tudo do banco antigo (Render) para o novo (Supabase)
 app.get('/migrate-data-render-to-supabase', async (req, res) => {
-  if (!process.env.DATABASE_URL_SUPABASE) {
-    return res.json({ ok: false, erro: 'DATABASE_URL_SUPABASE não configurada' });
-  }
-  if (!process.env.DATABASE_URL_OLD_RENDER) {
-    return res.json({ ok: false, erro: 'DATABASE_URL_OLD_RENDER não configurada. Adicione essa variável com a string antiga do Render.' });
-  }
-
-  const poolOrigem = new Pool({
-    connectionString: process.env.DATABASE_URL_OLD_RENDER,
-    ssl: { rejectUnauthorized: false }
-  });
-  const poolDestino = new Pool({
-    connectionString: process.env.DATABASE_URL_SUPABASE,
-    ssl: { rejectUnauthorized: false }
-  });
-
+  if (!process.env.DATABASE_URL_SUPABASE) return res.json({ ok: false, erro: 'DATABASE_URL_SUPABASE nao configurada' });
+  if (!process.env.DATABASE_URL_OLD_RENDER) return res.json({ ok: false, erro: 'DATABASE_URL_OLD_RENDER nao configurada.' });
+  const poolOrigem = new Pool({ connectionString: process.env.DATABASE_URL_OLD_RENDER, ssl: { rejectUnauthorized: false } });
+  const poolDestino = new Pool({ connectionString: process.env.DATABASE_URL_SUPABASE, ssl: { rejectUnauthorized: false } });
   const resultado = {};
-  const tabelas = [
-    'usuarios', 'modulos', 'escolas', 'turmas', 'adolescentes',
-    'historico_alojamentos', 'frequencia', 'controle_aula', 'cancelamento_turma',
-    'agenda', 'agenda_adolescentes', 'produtos', 'entregas', 'rios',
-    'rio_adolescentes', 'log_acesso', 'atendimentos'
-  ];
-
+  const tabelas = ['usuarios','modulos','escolas','turmas','adolescentes','historico_alojamentos','frequencia','controle_aula','cancelamento_turma','agenda','agenda_adolescentes','produtos','entregas','rios','rio_adolescentes','log_acesso','atendimentos'];
   try {
     for (const tabela of tabelas) {
       try {
         const origem = await poolOrigem.query(`SELECT * FROM ${tabela}`);
-        if (origem.rows.length === 0) {
-          resultado[tabela] = 'vazio (0 linhas)';
-          continue;
-        }
-
+        if (origem.rows.length === 0) { resultado[tabela] = 'vazio (0 linhas)'; continue; }
         await poolDestino.query(`DELETE FROM ${tabela}`);
-
         const colunas = Object.keys(origem.rows[0]);
         let inseridos = 0;
         for (const row of origem.rows) {
           const valores = colunas.map(c => row[c]);
-          const placeholders = colunas.map((_, i) => `$${i + 1}`).join(',');
-          const colunasStr = colunas.join(',');
-          try {
-            await poolDestino.query(
-              `INSERT INTO ${tabela} (${colunasStr}) VALUES (${placeholders})`,
-              valores
-            );
-            inseridos++;
-          } catch (e) {
-            // Ignora erros de linha individual e segue
-          }
+          const placeholders = colunas.map((_,i) => `$${i+1}`).join(',');
+          try { await poolDestino.query(`INSERT INTO ${tabela} (${colunas.join(',')}) VALUES (${placeholders})`, valores); inseridos++; } catch(e) {}
         }
         resultado[tabela] = `${inseridos}/${origem.rows.length} copiados`;
-
-        try {
-          await poolDestino.query(
-            `SELECT setval(pg_get_serial_sequence('${tabela}', 'id'), COALESCE((SELECT MAX(id) FROM ${tabela}), 1))`
-          );
-        } catch (e) {}
-
-      } catch (e) {
-        resultado[tabela] = 'ERRO: ' + e.message;
-      }
+        try { await poolDestino.query(`SELECT setval(pg_get_serial_sequence('${tabela}','id'),COALESCE((SELECT MAX(id) FROM ${tabela}),1))`); } catch(e) {}
+      } catch(e) { resultado[tabela] = 'ERRO: '+e.message; }
     }
-
     res.json({ ok: true, resultado });
-  } catch (e) {
-    res.json({ ok: false, erro: e.message });
-  } finally {
-    await poolOrigem.end();
-    await poolDestino.end();
-  }
+  } catch(e) { res.json({ ok: false, erro: e.message }); }
+  finally { await poolOrigem.end(); await poolDestino.end(); }
 });
 
 app.post('/api/login', async (req, res) => {
   const { nome, senha, matricula } = req.body;
-  const login = matricula || nome; // aceita matricula (campo principal) ou nome (fallback p/ Gestor)
+  const login = matricula || nome;
   try {
-    const r = await pool.query(
-      'SELECT * FROM usuarios WHERE (matricula=$1 OR LOWER(nome)=LOWER($1)) AND ativo=true',
-      [login]
-    );
+    const r = await pool.query('SELECT * FROM usuarios WHERE (matricula=$1 OR LOWER(nome)=LOWER($1)) AND ativo=true', [login]);
     if (!r.rows.length) return res.status(401).json({ ok: false, erro: 'Usuario ou senha incorretos' });
     const u = r.rows[0];
     if (!await bcrypt.compare(senha, u.senha_hash)) return res.status(401).json({ ok: false, erro: 'Usuario ou senha incorretos' });
@@ -272,13 +214,12 @@ app.post('/api/login', async (req, res) => {
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
-// Trocar a própria senha (qualquer usuário autenticado)
 app.put('/api/usuarios/trocar-senha', auth, async (req, res) => {
   const { senhaAtual, senhaNova } = req.body;
   if (!senhaAtual || !senhaNova) return res.status(400).json({ ok: false, erro: 'Preencha a senha atual e a nova senha.' });
   try {
     const r = await pool.query('SELECT * FROM usuarios WHERE id=$1', [req.usuario.id]);
-    if (!r.rows.length) return res.status(404).json({ ok: false, erro: 'Usuário não encontrado.' });
+    if (!r.rows.length) return res.status(404).json({ ok: false, erro: 'Usuario nao encontrado.' });
     const u = r.rows[0];
     if (!await bcrypt.compare(senhaAtual, u.senha_hash)) return res.status(401).json({ ok: false, erro: 'Senha atual incorreta.' });
     const novoHash = await bcrypt.hash(senhaNova, 10);
@@ -287,7 +228,6 @@ app.put('/api/usuarios/trocar-senha', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
-// ===== USUARIOS =====
 app.get('/api/usuarios', auth, async (req,res) => {
   const r = await pool.query('SELECT id,nome,perfil,matricula,ativo FROM usuarios ORDER BY nome');
   res.json({ ok:true, dados:r.rows });
@@ -295,7 +235,7 @@ app.get('/api/usuarios', auth, async (req,res) => {
 app.post('/api/usuarios', auth, async (req,res) => {
   const { nome, senha, perfil, matricula } = req.body;
   const hash = await bcrypt.hash(senha, 10);
-  const r = await pool.query('INSERT INTO usuarios (nome,senha_hash,perfil,matricula) VALUES ($1,$2,$3,$4) RETURNING id,nome,perfil,matricula', [nome,hash,perfil,matricula||null]);
+  const r = await pool.query('INSERT INTO usuarios (nome,senha_hash,perfil,matricula) VALUES ($1,$2,$3,$4) RETURNING id,nome,perfil,matricula',[nome,hash,perfil,matricula||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/usuarios/:id', auth, async (req,res) => {
@@ -313,9 +253,8 @@ app.delete('/api/usuarios/:id', auth, async (req,res) => {
   res.json({ ok:true });
 });
 
-// ===== CONFIG =====
 app.get('/api/config/modulos', auth, async (req,res) => {
-  const r = await pool.query('SELECT m.*,COUNT(a.id) FILTER(WHERE a.situacao=\'ativo\') as total FROM modulos m LEFT JOIN adolescentes a ON a.modulo_id=m.id WHERE m.ativo=true GROUP BY m.id ORDER BY m.nome');
+  const r = await pool.query("SELECT m.*,COUNT(a.id) FILTER(WHERE a.situacao='ativo') as total FROM modulos m LEFT JOIN adolescentes a ON a.modulo_id=m.id WHERE m.ativo=true GROUP BY m.id ORDER BY m.nome");
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/config/modulos', auth, async (req,res) => {
@@ -363,20 +302,17 @@ app.delete('/api/config/produtos/:id', auth, async (req,res) => {
   res.json({ ok:true });
 });
 
-// ===== ADOLESCENTES =====
 app.get('/api/adolescentes', auth, async (req,res) => {
   const r = await pool.query('SELECT a.*,m.nome as modulo_nome,t.nome as turma_nome,e.nome as escola_nome FROM adolescentes a LEFT JOIN modulos m ON a.modulo_id=m.id LEFT JOIN turmas t ON a.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id ORDER BY a.nome');
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/adolescentes', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv } = req.body;
-  const {alojamento} = req.body;
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento } = req.body;
   const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/adolescentes/:id', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv } = req.body;
-  const {alojamento} = req.body;
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento } = req.body;
   const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,alojamento=$10,atualizado_em=NOW() WHERE id=$11 RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,req.params.id]);
   res.json({ ok:true, dados:r.rows[0] });
 });
@@ -393,7 +329,6 @@ app.get('/api/adolescentes/:id/rios', auth, async (req,res) => {
   res.json({ ok:true, dados:r.rows });
 });
 
-// ===== FREQUÊNCIA =====
 app.get('/api/frequencia/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT f.*,a.nome as adolescente_nome,a.prontuario,t.nome as turma_nome,e.nome as escola_nome,m.nome as modulo_nome FROM frequencia f JOIN adolescentes a ON f.adolescente_id=a.id LEFT JOIN turmas t ON f.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id LEFT JOIN modulos m ON a.modulo_id=m.id WHERE f.data=$1 ORDER BY e.nome,t.nome,a.nome',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
@@ -418,14 +353,13 @@ app.post('/api/frequencia/cancelar-turma', auth, async (req,res) => {
   await pool.query('INSERT INTO cancelamento_turma (turma_id,data,cancelada,motivo) VALUES ($1,$2,true,$3) ON CONFLICT (turma_id,data) DO UPDATE SET cancelada=true,motivo=$3',[turma_id,data,motivo||null]);
   const alunos = await pool.query("SELECT id FROM adolescentes WHERE turma_id=$1 AND situacao='ativo'",[turma_id]);
   for (const a of alunos.rows) {
-    await pool.query('INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por) VALUES ($1,$2,$3,\'ausente\',$4,false,$5) ON CONFLICT (adolescente_id,data) DO UPDATE SET status=\'ausente\',motivo=$4',[a.id,turma_id,data,motivo||'Cancelamento de turma',registrado_por||null]);
+    await pool.query("INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por) VALUES ($1,$2,$3,'ausente',$4,$5) ON CONFLICT (adolescente_id,data) DO UPDATE SET status='ausente',motivo=$4",[a.id,turma_id,data,motivo||'Cancelamento de turma',registrado_por||null]);
   }
   res.json({ ok:true, total:alunos.rows.length });
 });
 
-// ===== AGENDA =====
 app.get('/api/agenda/:data', auth, async (req,res) => {
-  const r = await pool.query('SELECT a.*,COALESCE(json_agg(json_build_object(\'id\',ad.id,\'nome\',ad.nome)) FILTER(WHERE ad.id IS NOT NULL),\'[]\') as adolescentes FROM agenda a LEFT JOIN agenda_adolescentes aa ON a.id=aa.agenda_id LEFT JOIN adolescentes ad ON aa.adolescente_id=ad.id WHERE a.data=$1 GROUP BY a.id ORDER BY a.hora',[req.params.data]);
+  const r = await pool.query("SELECT a.*,COALESCE(json_agg(json_build_object('id',ad.id,'nome',ad.nome)) FILTER(WHERE ad.id IS NOT NULL),'[]') as adolescentes FROM agenda a LEFT JOIN agenda_adolescentes aa ON a.id=aa.agenda_id LEFT JOIN adolescentes ad ON aa.adolescente_id=ad.id WHERE a.data=$1 GROUP BY a.id ORDER BY a.hora",[req.params.data]);
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/agenda', auth, async (req,res) => {
@@ -447,7 +381,6 @@ app.delete('/api/agenda/:id', auth, async (req,res) => {
   res.json({ ok:true });
 });
 
-// ===== ALMOXARIFADO =====
 app.get('/api/almoxarifado/entregas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM entregas WHERE data=$1 ORDER BY hora DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
@@ -462,9 +395,8 @@ app.post('/api/almoxarifado/entregas', auth, async (req,res) => {
   res.json({ ok:true, dados:inseridos });
 });
 
-// ===== RIOs =====
 app.get('/api/rios', auth, async (req,res) => {
-  const r = await pool.query('SELECT ri.*,COALESCE(json_agg(json_build_object(\'id\',a.id,\'nome\',a.nome)) FILTER(WHERE a.id IS NOT NULL),\'[]\') as adolescentes FROM rios ri LEFT JOIN rio_adolescentes ra ON ri.id=ra.rio_id LEFT JOIN adolescentes a ON ra.adolescente_id=a.id GROUP BY ri.id ORDER BY ri.criado_em DESC');
+  const r = await pool.query("SELECT ri.*,COALESCE(json_agg(json_build_object('id',a.id,'nome',a.nome)) FILTER(WHERE a.id IS NOT NULL),'[]') as adolescentes FROM rios ri LEFT JOIN rio_adolescentes ra ON ri.id=ra.rio_id LEFT JOIN adolescentes a ON ra.adolescente_id=a.id GROUP BY ri.id ORDER BY ri.criado_em DESC");
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/rios', auth, async (req,res) => {
@@ -492,7 +424,6 @@ app.delete('/api/rios/:id', auth, async (req,res) => {
   res.json({ ok:true });
 });
 
-// ===== PLANTÃO =====
 app.post('/api/plantao/troca', auth, async (req,res) => {
   const { adolescente_id,modulo_destino_id,modulo_origem,modulo_destino,motivo,agente,observacao,data } = req.body;
   const client = await pool.connect();
@@ -510,7 +441,6 @@ app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   res.json({ ok:true, dados:r.rows });
 });
 
-// ===== ATENDIMENTOS TÉCNICOS =====
 app.get('/api/atendimentos', auth, async (req,res) => {
   try {
     const { data, profissional } = req.query;
@@ -523,38 +453,30 @@ app.get('/api/atendimentos', auth, async (req,res) => {
     res.json({ ok:true, dados:r.rows });
   } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
-
 app.post('/api/atendimentos', auth, async (req,res) => {
   try {
     const { profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs } = req.body;
     const r = await pool.query(
-      `INSERT INTO atendimentos (profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [profissional, area||null, adolescente_id||null, adolescente_nome||null, data, hora||null, tipo, saude_mental||false, obs||null]
+      'INSERT INTO atendimentos (profissional,area,adolescente_id,adolescente_nome,data,hora,tipo,saude_mental,obs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [profissional,area||null,adolescente_id||null,adolescente_nome||null,data,hora||null,tipo,saude_mental||false,obs||null]
     );
     res.json({ ok:true, dados:r.rows[0] });
   } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
-
 app.delete('/api/atendimentos/:id', auth, async (req,res) => {
   try {
-    await pool.query('DELETE FROM atendimentos WHERE id=$1', [req.params.id]);
+    await pool.query('DELETE FROM atendimentos WHERE id=$1',[req.params.id]);
     res.json({ ok:true });
   } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
-
 app.get('/api/atendimentos/periodo', auth, async (req,res) => {
   try {
     const { inicio, fim } = req.query;
-    const r = await pool.query(
-      'SELECT * FROM atendimentos WHERE data >= $1 AND data <= $2 ORDER BY profissional, data DESC',
-      [inicio, fim]
-    );
+    const r = await pool.query('SELECT * FROM atendimentos WHERE data >= $1 AND data <= $2 ORDER BY profissional,data DESC',[inicio,fim]);
     res.json({ ok:true, dados:r.rows });
   } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
 
-// ===== INICIAR =====
 initDB().then(() => {
   app.listen(PORT, () => console.log('CENSE-VR API porta ' + PORT));
 }).catch(err => { console.error(err); process.exit(1); });
