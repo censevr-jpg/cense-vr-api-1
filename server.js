@@ -9,7 +9,22 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'cense_vr_secret_2025';
+
+// O JWT_SECRET NUNCA pode ter um valor padrão fixo no código — quem tivesse
+// acesso ao código-fonte conseguiria forjar um login válido para qualquer
+// pessoa, sem saber a senha de ninguém. Por isso o servidor recusa iniciar
+// sem essa variável configurada de verdade no ambiente (Render → Environment).
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('[FATAL] Variável de ambiente JWT_SECRET não configurada. ' +
+    'Configure em Render → Environment antes de iniciar o servidor.');
+  process.exit(1);
+}
+
+// Chave de migração: protege as rotas administrativas de uso único
+// (migrar usuários do formato antigo, ajustes de esquema). Sem essa
+// variável configurada, essas rotas ficam completamente bloqueadas.
+const MIGRATION_KEY = process.env.MIGRATION_KEY || null;
 
 const CONNECTION_STRING = process.env.DATABASE_URL_SUPABASE || process.env.DATABASE_URL;
 const USANDO_SUPABASE = !!process.env.DATABASE_URL_SUPABASE;
@@ -23,7 +38,7 @@ const pool = new Pool({
 const corsOptions = {
   origin: true,
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
+  allowedHeaders: ['Content-Type','Authorization','x-migration-key'],
   credentials: false
 };
 app.use(cors(corsOptions));
@@ -32,7 +47,7 @@ app.options('*', cors(corsOptions));
 // Helmet depois do CORS
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 10000, max: 10000 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 10000 }));
 
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
@@ -138,7 +153,14 @@ async function initDB() {
       tipo VARCHAR(200) NOT NULL, saude_mental BOOLEAN DEFAULT false,
       obs TEXT, criado_em TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS estado_app (
+      chave VARCHAR(100) PRIMARY KEY,
+      dados JSONB NOT NULL,
+      atualizado_em TIMESTAMP DEFAULT NOW(),
+      atualizado_por VARCHAR(200)
+    );
   `);
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
   if (!existe.rows.length) {
     const hash = await bcrypt.hash('degase2025', 10);
@@ -157,7 +179,31 @@ function auth(req, res, next) {
 
 app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
+app.post('/api/log-acao', auth, async (req, res) => {
+  try {
+    const acao = (req.body && req.body.acao) ? String(req.body.acao).slice(0, 100) : 'Ação';
+    await pool.query('INSERT INTO log_acesso (usuario,acao) VALUES ($1,$2)', [req.usuario.nome, acao]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// Trava simples usada pelas rotas administrativas de uso único abaixo.
+// Sem MIGRATION_KEY configurada no ambiente, essas rotas ficam inacessíveis
+// para todo mundo — inclusive para quem tenta adivinhar a URL.
+function exigirChaveMigracao(req, res){
+  if(!MIGRATION_KEY){
+    res.status(403).json({ ok:false, erro:'Rota desativada: MIGRATION_KEY não configurada no servidor.' });
+    return false;
+  }
+  if(req.headers['x-migration-key'] !== MIGRATION_KEY){
+    res.status(401).json({ ok:false, erro:'Chave de migração ausente ou incorreta.' });
+    return false;
+  }
+  return true;
+}
+
 app.get('/migrate', async (req, res) => {
+  if(!exigirChaveMigracao(req, res)) return;
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
     await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
@@ -172,6 +218,7 @@ app.get('/migrate', async (req, res) => {
 });
 
 app.get('/migrate-data-render-to-supabase', async (req, res) => {
+  if(!exigirChaveMigracao(req, res)) return;
   if (!process.env.DATABASE_URL_SUPABASE) return res.json({ ok: false, erro: 'DATABASE_URL_SUPABASE nao configurada' });
   if (!process.env.DATABASE_URL_OLD_RENDER) return res.json({ ok: false, erro: 'DATABASE_URL_OLD_RENDER nao configurada.' });
   const poolOrigem = new Pool({ connectionString: process.env.DATABASE_URL_OLD_RENDER, ssl: { rejectUnauthorized: false } });
@@ -198,6 +245,82 @@ app.get('/migrate-data-render-to-supabase', async (req, res) => {
     res.json({ ok: true, resultado });
   } catch(e) { res.json({ ok: false, erro: e.message }); }
   finally { await poolOrigem.end(); await poolDestino.end(); }
+});
+
+// ===== ESTADO DO APP (formato provisório em blob único) =====
+// O frontend ainda guarda a maior parte dos dados como um pacote JSON único
+// (turmas, cursos, escalas, ofícios, etc.) em vez de tabelas separadas.
+// Estas rotas mantêm esse formato por enquanto, mas agora exigem login —
+// só o servidor fala com o banco; o navegador nunca mais acessa direto.
+const CHAVE_ESTADO = 'cense_vr';
+
+app.get('/api/estado', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT dados, atualizado_em, atualizado_por FROM estado_app WHERE chave=$1', [CHAVE_ESTADO]);
+    if (!r.rows.length) return res.json({ ok: true, dados: null, atualizado_em: null, atualizado_por: null });
+    res.json({ ok: true, dados: r.rows[0].dados, atualizado_em: r.rows[0].atualizado_em, atualizado_por: r.rows[0].atualizado_por });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+app.get('/api/estado/carimbo', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT atualizado_em FROM estado_app WHERE chave=$1', [CHAVE_ESTADO]);
+    if (!r.rows.length) return res.json({ ok: true, atualizado_em: null });
+    res.json({ ok: true, atualizado_em: r.rows[0].atualizado_em });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+app.put('/api/estado', auth, async (req, res) => {
+  try {
+    const { dados, atualizado_por } = req.body;
+    if (!dados) return res.status(400).json({ ok: false, erro: 'Envie { dados: {...} } no corpo.' });
+    const quem = atualizado_por || req.usuario?.nome || 'desconhecido';
+    const r = await pool.query(
+      `INSERT INTO estado_app (chave, dados, atualizado_em, atualizado_por) VALUES ($1,$2,NOW(),$3)
+       ON CONFLICT (chave) DO UPDATE SET dados=$2, atualizado_em=NOW(), atualizado_por=$3
+       RETURNING atualizado_em`,
+      [CHAVE_ESTADO, dados, quem]
+    );
+    res.json({ ok: true, atualizado_em: r.rows[0].atualizado_em });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// Rota de uso único: traz as senhas atuais (que já estavam em texto puro no
+// blob) para a tabela relacional de usuários, com bcrypt. Protegida por
+// MIGRATION_KEY, não por login — porque roda ANTES de existir qualquer
+// login funcional nessa tabela. Só funciona se ainda não houver ninguém
+// com matrícula cadastrado (evita rodar duas vezes por engano).
+app.post('/api/admin/migrar-usuarios-do-blob', async (req, res) => {
+  if(!exigirChaveMigracao(req, res)) return;
+  try {
+    const jaMigrado = await pool.query("SELECT COUNT(*) FROM usuarios WHERE matricula IS NOT NULL");
+    if (parseInt(jaMigrado.rows[0].count, 10) > 0) {
+      return res.json({ ok: false, erro: 'Já existem usuários com matrícula cadastrados — a migração não roda de novo por segurança.' });
+    }
+    const { usuarios } = req.body;
+    if (!Array.isArray(usuarios)) return res.status(400).json({ ok: false, erro: 'Envie { usuarios: [...] } no corpo.' });
+    let criados = 0, pulados = 0;
+    for (const u of usuarios) {
+      if (!u.nome || !u.senha) { pulados++; continue; }
+      const hash = await bcrypt.hash(u.senha, 10);
+      // Se já existir alguém com esse nome (ex: o "Gestor" criado no primeiro
+      // boot do servidor), atualiza em vez de duplicar.
+      const existente = await pool.query('SELECT id FROM usuarios WHERE LOWER(nome)=LOWER($1)', [u.nome]);
+      if (existente.rows.length) {
+        await pool.query(
+          'UPDATE usuarios SET senha_hash=$1, perfil=$2, matricula=$3, ativo=true WHERE id=$4',
+          [hash, u.perfil || 'plantao', u.matricula || null, existente.rows[0].id]
+        );
+      } else {
+        await pool.query(
+          'INSERT INTO usuarios (nome, senha_hash, perfil, matricula, ativo) VALUES ($1,$2,$3,$4,true)',
+          [u.nome, hash, u.perfil || 'plantao', u.matricula || null]
+        );
+      }
+      criados++;
+    }
+    res.json({ ok: true, criados, pulados });
+  } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -367,7 +490,9 @@ app.post('/api/agenda', auth, async (req,res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const r = await client.query('INSERT INTO agenda (data,hora,tipo,carater,modalidade,escolta,viatura,observacao,registrado_por) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[data,hora,tipo,carater||'Externa',modalidade||'Presencial',escolta||null,viatura||null,observacao||null,registrado_por||null]);
+    // Usar nome do usuário autenticado se não vier registrado_por
+    const nomeRegistrador = registrado_por || req.usuario?.nome || 'Sistema';
+    const r = await client.query('INSERT INTO agenda (data,hora,tipo,carater,modalidade,escolta,viatura,observacao,registrado_por) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[data,hora,tipo,carater||'Externa',modalidade||'Presencial',escolta||null,viatura||null,observacao||null,nomeRegistrador]);
     if (adolescentes && adolescentes.length) {
       for (const aid of adolescentes) await client.query('INSERT INTO agenda_adolescentes (agenda_id,adolescente_id) VALUES ($1,$2)',[r.rows[0].id,aid]);
     }
