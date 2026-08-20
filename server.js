@@ -312,15 +312,11 @@ app.put('/api/estado', auth, async (req, res) => {
 // Rota de uso único: traz as senhas atuais (que já estavam em texto puro no
 // blob) para a tabela relacional de usuários, com bcrypt. Protegida por
 // MIGRATION_KEY, não por login — porque roda ANTES de existir qualquer
-// login funcional nessa tabela. Só funciona se ainda não houver ninguém
-// com matrícula cadastrado (evita rodar duas vezes por engano).
+// login funcional nessa tabela. Pode ser rodada mais de uma vez sem risco:
+// para cada pessoa, atualiza quem já existe (por nome) em vez de duplicar.
 app.post('/api/admin/migrar-usuarios-do-blob', async (req, res) => {
   if(!exigirChaveMigracao(req, res)) return;
   try {
-    const jaMigrado = await pool.query("SELECT COUNT(*) FROM usuarios WHERE matricula IS NOT NULL");
-    if (parseInt(jaMigrado.rows[0].count, 10) > 0) {
-      return res.json({ ok: false, erro: 'Já existem usuários com matrícula cadastrados — a migração não roda de novo por segurança.' });
-    }
     const { usuarios } = req.body;
     if (!Array.isArray(usuarios)) return res.status(400).json({ ok: false, erro: 'Envie { usuarios: [...] } no corpo.' });
     let criados = 0, pulados = 0;
