@@ -164,6 +164,27 @@ async function initDB() {
   await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true");
   await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()");
   await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS perfil VARCHAR(50) DEFAULT 'agente'");
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT");
+
+  // Migração automática: essa tabela já existia com senhas em TEXTO PURO
+  // numa coluna chamada "senha" (de uma versão anterior). Toda vez que o
+  // servidor inicia, qualquer linha que ainda tenha "senha" em texto puro
+  // e não tenha "senha_hash" preenchido é migrada para bcrypt aqui — e o
+  // texto puro é apagado logo em seguida. Isso roda sozinho, sem precisar
+  // de nenhuma rota manual, e não faz nada se já estiver tudo migrado.
+  try {
+    const pendentes = await pool.query(
+      "SELECT id, senha FROM usuarios WHERE senha IS NOT NULL AND senha <> '' AND (senha_hash IS NULL OR senha_hash = '')"
+    );
+    for (const row of pendentes.rows) {
+      const hash = await bcrypt.hash(row.senha, 10);
+      await pool.query("UPDATE usuarios SET senha_hash=$1, senha=NULL WHERE id=$2", [hash, row.id]);
+    }
+    if (pendentes.rows.length) {
+      console.log('[MIGRACAO] ' + pendentes.rows.length + ' senha(s) em texto puro migrada(s) para bcrypt.');
+    }
+  } catch(e) { console.warn('[MIGRACAO] aviso ao migrar senhas legadas:', e.message); }
+
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
   if (!existe.rows.length) {
     const hash = await bcrypt.hash('degase2025', 10);
