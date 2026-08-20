@@ -161,6 +161,9 @@ async function initDB() {
     );
   `);
   await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT true");
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()");
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS perfil VARCHAR(50) DEFAULT 'agente'");
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
   if (!existe.rows.length) {
     const hash = await bcrypt.hash('degase2025', 10);
