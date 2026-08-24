@@ -326,6 +326,33 @@ app.put('/api/estado', auth, async (req, res) => {
     const { dados, atualizado_por } = req.body;
     if (!dados) return res.status(400).json({ ok: false, erro: 'Envie { dados: {...} } no corpo.' });
     const quem = atualizado_por || req.usuario?.nome || 'desconhecido';
+
+    // REDE DE SEGURANÇA: compara com o que já está salvo antes de aceitar
+    // a gravação. Se o que está chegando teria drasticamente menos dados
+    // do que já existe (sinal clássico de uma aba com cache antigo
+    // salvando por cima sem querer), a gravação é recusada. Isso já
+    // aconteceu mais de uma vez e apagou escola/turmas/cadastros reais.
+    const atual = await pool.query('SELECT dados FROM estado_app WHERE chave=$1', [CHAVE_ESTADO]);
+    if (atual.rows.length) {
+      const antigo = atual.rows[0].dados;
+      const lenAntigo = (campo) => Array.isArray(antigo?.[campo]) ? antigo[campo].length : 0;
+      const lenNovo   = (campo) => Array.isArray(dados?.[campo])  ? dados[campo].length  : 0;
+
+      // escolas/turmas: essa unidade sempre tem pelo menos 1 escola e
+      // várias turmas. Ir de "tem" para "zero" nunca é uma edição legítima.
+      if (lenAntigo('escolas') > 0 && lenNovo('escolas') === 0) {
+        return res.status(409).json({ ok:false, erro:'Gravação recusada: escolas iria de '+lenAntigo('escolas')+' para 0. Atualize a página (F5) e tente de novo.' });
+      }
+      if (lenAntigo('turmas') > 0 && lenNovo('turmas') === 0) {
+        return res.status(409).json({ ok:false, erro:'Gravação recusada: turmas iria de '+lenAntigo('turmas')+' para 0. Atualize a página (F5) e tente de novo.' });
+      }
+      // adolescentes: uma queda brusca (menos da metade) é sinal do mesmo problema.
+      const adAntigo = lenAntigo('adolescentes'), adNovo = lenNovo('adolescentes');
+      if (adAntigo >= 10 && adNovo < adAntigo * 0.5) {
+        return res.status(409).json({ ok:false, erro:'Gravação recusada: adolescentes cairia de '+adAntigo+' para '+adNovo+'. Atualize a página (F5) e tente de novo.' });
+      }
+    }
+
     const r = await pool.query(
       `INSERT INTO estado_app (chave, dados, atualizado_em, atualizado_por) VALUES ($1,$2,NOW(),$3)
        ON CONFLICT (chave) DO UPDATE SET dados=$2, atualizado_em=NOW(), atualizado_por=$3
