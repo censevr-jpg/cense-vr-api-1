@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -6,19 +7,19 @@ const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-
+ 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cense_vr_secret_2025';
-
+ 
 const CONNECTION_STRING = process.env.DATABASE_URL_SUPABASE || process.env.DATABASE_URL;
 const USANDO_SUPABASE = !!process.env.DATABASE_URL_SUPABASE;
-
+ 
 const pool = new Pool({
   connectionString: CONNECTION_STRING,
   ssl: { rejectUnauthorized: false }
 });
-
+ 
 // CORS PRIMEIRO - antes do helmet
 const corsOptions = {
   origin: true,
@@ -28,12 +29,58 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-
+ 
 // Helmet depois do CORS
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 10000 }));
-
+ 
+// ===================================================================
+// BLINDAGEM CONTRA QUEDA DO SERVIDOR (2026-08-25)
+// A maioria das rotas abaixo faz "await pool.query(...)" sem try/catch.
+// Numa rota async do Express, se essa promise rejeitar (erro de SQL,
+// violação de constraint, conexão caindo, etc.), o erro NÃO vira uma
+// resposta HTTP — ele vira uma "unhandled promise rejection" solta no
+// processo Node. A partir do Node 15, isso DERRUBA o processo inteiro na
+// hora. O Render reinicia sozinho, mas leva alguns segundos — e nesse
+// intervalo toda requisição bate num erro 502 do próprio Render, que não
+// tem cabeçalho CORS, e por isso aparece no navegador como "bloqueado por
+// política de CORS" mesmo o problema não sendo CORS nenhum. Foi isso que
+// causou os erros de login e de importação em massa: uma única linha com
+// problema (nome duplicado, dado inesperado, etc.) no meio de várias
+// chamadas em sequência derrubava o servidor pra todo mundo.
+//
+// Em vez de reescrever rota por rota, isso aqui envolve toda rota
+// registrada com app.get/post/put/delete/patch: se o handler (mesmo sem
+// try/catch) rejeitar, a resposta vira um 500 normal em vez de derrubar o
+// servidor. As rotas que já tinham try/catch continuam funcionando igual.
+['get','post','put','delete','patch'].forEach(metodo => {
+  const original = app[metodo].bind(app);
+  app[metodo] = (caminho, ...handlers) => {
+    const seguros = handlers.map(h => {
+      if (typeof h !== 'function') return h;
+      return (req, res, next) => {
+        Promise.resolve(h(req, res, next)).catch(e => {
+          console.error(`Erro em ${metodo.toUpperCase()} ${caminho}:`, e);
+          if (!res.headersSent) res.status(500).json({ ok:false, erro: e.message || 'Erro interno' });
+        });
+      };
+    });
+    return original(caminho, ...seguros);
+  };
+});
+ 
+// Rede de segurança final: se algo ainda assim escapar (fora de uma rota
+// Express), loga em vez de derrubar o processo. Não interfere no
+// initDB().catch(...) lá embaixo, que já trata seu próprio erro de
+// inicialização.
+process.on('unhandledRejection', (motivo) => {
+  console.error('Unhandled Rejection (servidor continua no ar):', motivo);
+});
+process.on('uncaughtException', (erro) => {
+  console.error('Uncaught Exception (servidor continua no ar):', erro);
+});
+ 
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
   if(typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
@@ -44,7 +91,7 @@ function parseDate(d){
   }
   return null;
 }
-
+ 
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -147,16 +194,20 @@ async function initDB() {
   }
   console.log('Banco inicializado!');
 }
-
+ 
 function auth(req, res, next) {
   const h = req.headers.authorization;
   if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ ok: false, erro: 'Nao autenticado' });
   try { req.usuario = jwt.verify(h.slice(7), JWT_SECRET); next(); }
   catch { res.status(401).json({ ok: false, erro: 'Token invalido' }); }
 }
-
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
-
+ 
+// A 'versao' serve para conferir, sem adivinhacao, se o server.js que
+// esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
+// servidor publicado e antigo — e rotas novas como
+// /api/frequencia/periodo nao existem la, o que derruba o processo.
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.9', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+ 
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
@@ -171,7 +222,7 @@ app.get('/migrate', async (req, res) => {
     res.json({ ok: true, msg: 'Migracao concluida!' });
   } catch(e) { res.json({ ok: false, erro: e.message }); }
 });
-
+ 
 app.get('/migrate-data-render-to-supabase', async (req, res) => {
   if (!process.env.DATABASE_URL_SUPABASE) return res.json({ ok: false, erro: 'DATABASE_URL_SUPABASE nao configurada' });
   if (!process.env.DATABASE_URL_OLD_RENDER) return res.json({ ok: false, erro: 'DATABASE_URL_OLD_RENDER nao configurada.' });
@@ -200,7 +251,7 @@ app.get('/migrate-data-render-to-supabase', async (req, res) => {
   } catch(e) { res.json({ ok: false, erro: e.message }); }
   finally { await poolOrigem.end(); await poolDestino.end(); }
 });
-
+ 
 app.post('/api/login', async (req, res) => {
   const { nome, senha, matricula } = req.body;
   const login = matricula || nome;
@@ -214,7 +265,7 @@ app.post('/api/login', async (req, res) => {
     res.json({ ok: true, token, usuario: { id: u.id, nome: u.nome, perfil: u.perfil, matricula: u.matricula } });
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
-
+ 
 app.put('/api/usuarios/trocar-senha', auth, async (req, res) => {
   const { senhaAtual, senhaNova } = req.body;
   if (!senhaAtual || !senhaNova) return res.status(400).json({ ok: false, erro: 'Preencha a senha atual e a nova senha.' });
@@ -228,7 +279,7 @@ app.put('/api/usuarios/trocar-senha', auth, async (req, res) => {
     res.json({ ok: true, msg: 'Senha alterada com sucesso!' });
   } catch(e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
-
+ 
 app.get('/api/usuarios', auth, async (req,res) => {
   const r = await pool.query('SELECT id,nome,perfil,matricula,ativo FROM usuarios ORDER BY nome');
   res.json({ ok:true, dados:r.rows });
@@ -253,7 +304,7 @@ app.delete('/api/usuarios/:id', auth, async (req,res) => {
   await pool.query('UPDATE usuarios SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
-
+ 
 app.get('/api/config/modulos', auth, async (req,res) => {
   const r = await pool.query("SELECT m.*,COUNT(a.id) FILTER(WHERE a.situacao='ativo') as total FROM modulos m LEFT JOIN adolescentes a ON a.modulo_id=m.id WHERE m.ativo=true GROUP BY m.id ORDER BY m.nome");
   res.json({ ok:true, dados:r.rows });
@@ -302,7 +353,7 @@ app.delete('/api/config/produtos/:id', auth, async (req,res) => {
   await pool.query('UPDATE produtos SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
-
+ 
 app.get('/api/adolescentes', auth, async (req,res) => {
   const r = await pool.query('SELECT a.*,m.nome as modulo_nome,t.nome as turma_nome,e.nome as escola_nome FROM adolescentes a LEFT JOIN modulos m ON a.modulo_id=m.id LEFT JOIN turmas t ON a.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id ORDER BY a.nome');
   res.json({ ok:true, dados:r.rows });
@@ -364,7 +415,87 @@ app.get('/api/adolescentes/:id/rios', auth, async (req,res) => {
   const r = await pool.query('SELECT r.* FROM rios r JOIN rio_adolescentes ra ON r.id=ra.rio_id WHERE ra.adolescente_id=$1 ORDER BY r.data DESC',[req.params.id]);
   res.json({ ok:true, dados:r.rows });
 });
-
+ 
+// ===================================================================
+// FREQUENCIA POR PERIODO (leitura) — precisa vir ANTES de
+// '/api/frequencia/:data', senao o Express casa "periodo" como se fosse
+// uma data e essa rota nunca e alcancada.
+//
+// Ate agora a frequencia era GRAVADA no servidor mas NUNCA LIDA de volta:
+// carregarDadosAPI() nao buscava frequencia nenhuma, entao a chamada so
+// existia no localStorage do navegador onde foi marcada. Quem abrisse o
+// sistema em outro computador (ou depois de limpar o cache) via tudo em
+// branco, como se nada tivesse sido lancado. Esta rota devolve, de uma vez
+// so, tudo que o periodo tem: frequencia, controle de aula por escola e
+// cancelamento de turma.
+// ===================================================================
+app.get('/api/frequencia/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const f = await pool.query(
+    'SELECT adolescente_id, turma_id, data, status, motivo, registrado_por FROM frequencia WHERE data >= $1 AND data <= $2 ORDER BY data',
+    [inicio, fim]
+  );
+  const c = await pool.query(
+    'SELECT escola_id, data, haula, motivo_sem_aula FROM controle_aula WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  const ct = await pool.query(
+    'SELECT turma_id, data, cancelada, motivo FROM cancelamento_turma WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  res.json({ ok:true, frequencia:f.rows, controles:c.rows, cancelamentos:ct.rows });
+});
+ 
+// Gravacao EM LOTE — usada pela restauracao de backup. Mandar 600+
+// requisicoes uma a uma demora minutos e qualquer queda no meio deixa a
+// restauracao pela metade sem ninguem saber onde parou; aqui tudo entra
+// numa transacao so: ou grava tudo, ou nao grava nada.
+app.post('/api/frequencia/lote', auth, async (req,res) => {
+  const { frequencia = [], controles = [], cancelamentos = [] } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let nFreq = 0, nCtrl = 0, nCanc = 0;
+    for (const f of frequencia) {
+      if (!f || !f.adolescente_id || !f.data || !f.status) continue;
+      await client.query(
+        `INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (adolescente_id,data)
+         DO UPDATE SET status=$4, motivo=$5, registrado_por=$6, turma_id=$2`,
+        [f.adolescente_id, f.turma_id || null, f.data, f.status, f.motivo || null, f.registrado_por || null]
+      );
+      nFreq++;
+    }
+    for (const c of controles) {
+      if (!c || !c.escola_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO controle_aula (escola_id,data,haula,motivo_sem_aula) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (escola_id,data) DO UPDATE SET haula=$3, motivo_sem_aula=$4`,
+        [c.escola_id, c.data, c.haula !== false, c.motivo_sem_aula || null]
+      );
+      nCtrl++;
+    }
+    for (const c of cancelamentos) {
+      if (!c || !c.turma_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO cancelamento_turma (turma_id,data,cancelada,motivo) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (turma_id,data) DO UPDATE SET cancelada=$3, motivo=$4`,
+        [c.turma_id, c.data, c.cancelada !== false, c.motivo || null]
+      );
+      nCanc++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, frequencia:nFreq, controles:nCtrl, cancelamentos:nCanc });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally {
+    client.release();
+  }
+});
+ 
 app.get('/api/frequencia/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT f.*,a.nome as adolescente_nome,a.prontuario,t.nome as turma_nome,e.nome as escola_nome,m.nome as modulo_nome FROM frequencia f JOIN adolescentes a ON f.adolescente_id=a.id LEFT JOIN turmas t ON f.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id LEFT JOIN modulos m ON a.modulo_id=m.id WHERE f.data=$1 ORDER BY e.nome,t.nome,a.nome',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
@@ -393,7 +524,7 @@ app.post('/api/frequencia/cancelar-turma', auth, async (req,res) => {
   }
   res.json({ ok:true, total:alunos.rows.length });
 });
-
+ 
 app.get('/api/agenda/:data', auth, async (req,res) => {
   const r = await pool.query("SELECT a.*,COALESCE(json_agg(json_build_object('id',ad.id,'nome',ad.nome)) FILTER(WHERE ad.id IS NOT NULL),'[]') as adolescentes FROM agenda a LEFT JOIN agenda_adolescentes aa ON a.id=aa.agenda_id LEFT JOIN adolescentes ad ON aa.adolescente_id=ad.id WHERE a.data=$1 GROUP BY a.id ORDER BY a.hora",[req.params.data]);
   res.json({ ok:true, dados:r.rows });
@@ -418,7 +549,7 @@ app.delete('/api/agenda/:id', auth, async (req,res) => {
   await pool.query('DELETE FROM agenda WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
-
+ 
 app.get('/api/almoxarifado/entregas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM entregas WHERE data=$1 ORDER BY hora DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
@@ -432,7 +563,7 @@ app.post('/api/almoxarifado/entregas', auth, async (req,res) => {
   }
   res.json({ ok:true, dados:inseridos });
 });
-
+ 
 app.get('/api/rios', auth, async (req,res) => {
   const r = await pool.query("SELECT ri.*,COALESCE(json_agg(json_build_object('id',a.id,'nome',a.nome)) FILTER(WHERE a.id IS NOT NULL),'[]') as adolescentes FROM rios ri LEFT JOIN rio_adolescentes ra ON ri.id=ra.rio_id LEFT JOIN adolescentes a ON ra.adolescente_id=a.id GROUP BY ri.id ORDER BY ri.criado_em DESC");
   res.json({ ok:true, dados:r.rows });
@@ -461,7 +592,7 @@ app.delete('/api/rios/:id', auth, async (req,res) => {
   await pool.query('DELETE FROM rios WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
-
+ 
 app.post('/api/plantao/troca', auth, async (req,res) => {
   const { adolescente_id,modulo_destino_id,modulo_origem,modulo_destino,motivo,agente,observacao,data } = req.body;
   const client = await pool.connect();
@@ -478,7 +609,7 @@ app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
 });
-
+ 
 app.get('/api/atendimentos', auth, async (req,res) => {
   try {
     const { data, profissional } = req.query;
@@ -514,7 +645,8 @@ app.get('/api/atendimentos/periodo', auth, async (req,res) => {
     res.json({ ok:true, dados:r.rows });
   } catch(e){ res.status(500).json({ ok:false, erro:e.message }); }
 });
-
+ 
 initDB().then(() => {
   app.listen(PORT, () => console.log('CENSE-VR API porta ' + PORT));
 }).catch(err => { console.error(err); process.exit(1); });
+ 
