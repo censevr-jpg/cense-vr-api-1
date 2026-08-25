@@ -34,6 +34,52 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 10000 }));
 
+// ===================================================================
+// BLINDAGEM CONTRA QUEDA DO SERVIDOR (2026-08-25)
+// A maioria das rotas abaixo faz "await pool.query(...)" sem try/catch.
+// Numa rota async do Express, se essa promise rejeitar (erro de SQL,
+// violação de constraint, conexão caindo, etc.), o erro NÃO vira uma
+// resposta HTTP — ele vira uma "unhandled promise rejection" solta no
+// processo Node. A partir do Node 15, isso DERRUBA o processo inteiro na
+// hora. O Render reinicia sozinho, mas leva alguns segundos — e nesse
+// intervalo toda requisição bate num erro 502 do próprio Render, que não
+// tem cabeçalho CORS, e por isso aparece no navegador como "bloqueado por
+// política de CORS" mesmo o problema não sendo CORS nenhum. Foi isso que
+// causou os erros de login e de importação em massa: uma única linha com
+// problema (nome duplicado, dado inesperado, etc.) no meio de várias
+// chamadas em sequência derrubava o servidor pra todo mundo.
+//
+// Em vez de reescrever rota por rota, isso aqui envolve toda rota
+// registrada com app.get/post/put/delete/patch: se o handler (mesmo sem
+// try/catch) rejeitar, a resposta vira um 500 normal em vez de derrubar o
+// servidor. As rotas que já tinham try/catch continuam funcionando igual.
+['get','post','put','delete','patch'].forEach(metodo => {
+  const original = app[metodo].bind(app);
+  app[metodo] = (caminho, ...handlers) => {
+    const seguros = handlers.map(h => {
+      if (typeof h !== 'function') return h;
+      return (req, res, next) => {
+        Promise.resolve(h(req, res, next)).catch(e => {
+          console.error(`Erro em ${metodo.toUpperCase()} ${caminho}:`, e);
+          if (!res.headersSent) res.status(500).json({ ok:false, erro: e.message || 'Erro interno' });
+        });
+      };
+    });
+    return original(caminho, ...seguros);
+  };
+});
+
+// Rede de segurança final: se algo ainda assim escapar (fora de uma rota
+// Express), loga em vez de derrubar o processo. Não interfere no
+// initDB().catch(...) lá embaixo, que já trata seu próprio erro de
+// inicialização.
+process.on('unhandledRejection', (motivo) => {
+  console.error('Unhandled Rejection (servidor continua no ar):', motivo);
+});
+process.on('uncaughtException', (erro) => {
+  console.error('Uncaught Exception (servidor continua no ar):', erro);
+});
+
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
   if(typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
@@ -155,7 +201,11 @@ function auth(req, res, next) {
   catch { res.status(401).json({ ok: false, erro: 'Token invalido' }); }
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+// A 'versao' serve para conferir, sem adivinhacao, se o server.js que
+// esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
+// servidor publicado e antigo — e rotas novas como
+// /api/frequencia/periodo nao existem la, o que derruba o processo.
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.9', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 app.get('/migrate', async (req, res) => {
   try {
@@ -363,6 +413,86 @@ app.get('/api/adolescentes/:id/historico', auth, async (req,res) => {
 app.get('/api/adolescentes/:id/rios', auth, async (req,res) => {
   const r = await pool.query('SELECT r.* FROM rios r JOIN rio_adolescentes ra ON r.id=ra.rio_id WHERE ra.adolescente_id=$1 ORDER BY r.data DESC',[req.params.id]);
   res.json({ ok:true, dados:r.rows });
+});
+
+// ===================================================================
+// FREQUENCIA POR PERIODO (leitura) — precisa vir ANTES de
+// '/api/frequencia/:data', senao o Express casa "periodo" como se fosse
+// uma data e essa rota nunca e alcancada.
+//
+// Ate agora a frequencia era GRAVADA no servidor mas NUNCA LIDA de volta:
+// carregarDadosAPI() nao buscava frequencia nenhuma, entao a chamada so
+// existia no localStorage do navegador onde foi marcada. Quem abrisse o
+// sistema em outro computador (ou depois de limpar o cache) via tudo em
+// branco, como se nada tivesse sido lancado. Esta rota devolve, de uma vez
+// so, tudo que o periodo tem: frequencia, controle de aula por escola e
+// cancelamento de turma.
+// ===================================================================
+app.get('/api/frequencia/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const f = await pool.query(
+    'SELECT adolescente_id, turma_id, data, status, motivo, registrado_por FROM frequencia WHERE data >= $1 AND data <= $2 ORDER BY data',
+    [inicio, fim]
+  );
+  const c = await pool.query(
+    'SELECT escola_id, data, haula, motivo_sem_aula FROM controle_aula WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  const ct = await pool.query(
+    'SELECT turma_id, data, cancelada, motivo FROM cancelamento_turma WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  res.json({ ok:true, frequencia:f.rows, controles:c.rows, cancelamentos:ct.rows });
+});
+
+// Gravacao EM LOTE — usada pela restauracao de backup. Mandar 600+
+// requisicoes uma a uma demora minutos e qualquer queda no meio deixa a
+// restauracao pela metade sem ninguem saber onde parou; aqui tudo entra
+// numa transacao so: ou grava tudo, ou nao grava nada.
+app.post('/api/frequencia/lote', auth, async (req,res) => {
+  const { frequencia = [], controles = [], cancelamentos = [] } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let nFreq = 0, nCtrl = 0, nCanc = 0;
+    for (const f of frequencia) {
+      if (!f || !f.adolescente_id || !f.data || !f.status) continue;
+      await client.query(
+        `INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (adolescente_id,data)
+         DO UPDATE SET status=$4, motivo=$5, registrado_por=$6, turma_id=$2`,
+        [f.adolescente_id, f.turma_id || null, f.data, f.status, f.motivo || null, f.registrado_por || null]
+      );
+      nFreq++;
+    }
+    for (const c of controles) {
+      if (!c || !c.escola_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO controle_aula (escola_id,data,haula,motivo_sem_aula) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (escola_id,data) DO UPDATE SET haula=$3, motivo_sem_aula=$4`,
+        [c.escola_id, c.data, c.haula !== false, c.motivo_sem_aula || null]
+      );
+      nCtrl++;
+    }
+    for (const c of cancelamentos) {
+      if (!c || !c.turma_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO cancelamento_turma (turma_id,data,cancelada,motivo) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (turma_id,data) DO UPDATE SET cancelada=$3, motivo=$4`,
+        [c.turma_id, c.data, c.cancelada !== false, c.motivo || null]
+      );
+      nCanc++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, frequencia:nFreq, controles:nCtrl, cancelamentos:nCanc });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/frequencia/:data', auth, async (req,res) => {
