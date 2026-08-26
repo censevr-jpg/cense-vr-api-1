@@ -113,7 +113,9 @@ async function initDB() {
       nascimento DATE, modulo_id INTEGER REFERENCES modulos(id),
       turma_id INTEGER REFERENCES turmas(id), cidade VARCHAR(100),
       entrada DATE, situacao VARCHAR(30) DEFAULT 'ativo', tv BOOLEAN DEFAULT false,
-      alojamento VARCHAR(20), tipo_desligamento VARCHAR(30), atualizado_em TIMESTAMP DEFAULT NOW()
+      alojamento VARCHAR(20), tipo_desligamento VARCHAR(30),
+      rg VARCHAR(40), cpf VARCHAR(30), mae_nome VARCHAR(200),
+      atualizado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS historico_alojamentos (
       id SERIAL PRIMARY KEY, adolescente_id INTEGER REFERENCES adolescentes(id),
@@ -219,13 +221,20 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.11', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.12', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS tipo_desligamento VARCHAR(30)");
     await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
+    // RG, CPF e nome da mãe: existiam no formulário e eram digitados, mas
+    // NUNCA eram enviados ao servidor — e como o app reconstrói a lista de
+    // adolescentes a partir do banco a cada sincronização, sumiam do
+    // navegador junto. Nenhum dos 80 cadastros tinha nome da mãe guardado.
+    await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS rg VARCHAR(40)");
+    await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS cpf VARCHAR(30)");
+    await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS mae_nome VARCHAR(200)");
     await pool.query(`CREATE TABLE IF NOT EXISTS configuracoes (
       chave VARCHAR(100) PRIMARY KEY, valor JSONB NOT NULL,
       atualizado_em TIMESTAMP DEFAULT NOW(), atualizado_por VARCHAR(200)
@@ -481,13 +490,24 @@ app.get('/api/adolescentes', auth, async (req,res) => {
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/adolescentes', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento } = req.body;
-  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null]);
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento,rg,cpf,mae_nome } = req.body;
+  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento,rg,cpf,mae_nome) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null,rg||null,cpf||null,mae_nome||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/adolescentes/:id', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento } = req.body;
-  const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,alojamento=$10,tipo_desligamento=$11,atualizado_em=NOW() WHERE id=$12 RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null,req.params.id]);
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento,rg,cpf,mae_nome } = req.body;
+  // COALESCE nos três campos novos: se a chamada não trouxer rg/cpf/mãe
+  // (por exemplo uma tela antiga, ou uma planilha que só mexe em turma),
+  // o que já está gravado é mantido em vez de ser apagado. Sem isso,
+  // qualquer atualização parcial zeraria esses dados.
+  const r = await pool.query(
+    `UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,
+       cidade=$6,entrada=$7,situacao=$8,tv=$9,alojamento=$10,tipo_desligamento=$11,
+       rg=COALESCE($12,rg), cpf=COALESCE($13,cpf), mae_nome=COALESCE($14,mae_nome),
+       atualizado_em=NOW()
+     WHERE id=$15 RETURNING *`,
+    [nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null,rg||null,cpf||null,mae_nome||null,req.params.id]
+  );
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.delete('/api/adolescentes/:id', auth, async (req,res) => {
