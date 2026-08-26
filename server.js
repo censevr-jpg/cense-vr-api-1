@@ -121,12 +121,15 @@ async function initDB() {
       id SERIAL PRIMARY KEY, adolescente_id INTEGER REFERENCES adolescentes(id),
       modulo_origem VARCHAR(100), modulo_destino VARCHAR(100), motivo TEXT,
       agente VARCHAR(200), observacao TEXT, data DATE DEFAULT CURRENT_DATE,
+      alojamento_origem VARCHAR(20), alojamento_destino VARCHAR(20),
+      hora VARCHAR(10),
       criado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS frequencia (
       id SERIAL PRIMARY KEY, adolescente_id INTEGER REFERENCES adolescentes(id),
       turma_id INTEGER, data DATE NOT NULL, status VARCHAR(20) DEFAULT 'nao_registrado',
-      motivo TEXT, registrado_por VARCHAR(200), criado_em TIMESTAMP DEFAULT NOW(),
+      motivo TEXT, registrado_por VARCHAR(200), codigo VARCHAR(5),
+      criado_em TIMESTAMP DEFAULT NOW(),
       UNIQUE(adolescente_id, data)
     );
     CREATE TABLE IF NOT EXISTS controle_aula (
@@ -221,7 +224,7 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.12', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.16', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 app.get('/migrate', async (req, res) => {
   try {
@@ -235,6 +238,18 @@ app.get('/migrate', async (req, res) => {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS rg VARCHAR(40)");
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS cpf VARCHAR(30)");
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS mae_nome VARCHAR(200)");
+    // Troca de plantao: o alojamento (12.3, 5.1...) e a hora eram
+    // mostrados na tela mas nao existiam no banco — so o modulo era
+    // guardado. Sem eles, a troca lida de volta viria incompleta.
+    await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_origem VARCHAR(20)");
+    await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_destino VARCHAR(20)");
+    await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS hora VARCHAR(10)");
+    // codigo CD/CE da frequencia: CD = cancelado por baixo efetivo
+    // (responsabilidade da unidade), CE = cancelado/suspenso pela escola.
+    // A "efetividade do plantao" e calculada em cima justamente dessa
+    // distincao, mas o codigo nunca era gravado — entao depois de um sync
+    // todo cancelamento virava CE e a conta ficava sempre 100%.
+    await pool.query("ALTER TABLE frequencia ADD COLUMN IF NOT EXISTS codigo VARCHAR(5)");
     await pool.query(`CREATE TABLE IF NOT EXISTS configuracoes (
       chave VARCHAR(100) PRIMARY KEY, valor JSONB NOT NULL,
       atualizado_em TIMESTAMP DEFAULT NOW(), atualizado_por VARCHAR(200)
@@ -575,7 +590,7 @@ app.get('/api/frequencia/periodo', auth, async (req,res) => {
   const { inicio, fim } = req.query;
   if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
   const f = await pool.query(
-    'SELECT adolescente_id, turma_id, data, status, motivo, registrado_por FROM frequencia WHERE data >= $1 AND data <= $2 ORDER BY data',
+    'SELECT adolescente_id, turma_id, data, status, motivo, codigo, registrado_por FROM frequencia WHERE data >= $1 AND data <= $2 ORDER BY data',
     [inicio, fim]
   );
   const c = await pool.query(
@@ -602,11 +617,11 @@ app.post('/api/frequencia/lote', auth, async (req,res) => {
     for (const f of frequencia) {
       if (!f || !f.adolescente_id || !f.data || !f.status) continue;
       await client.query(
-        `INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por)
-         VALUES ($1,$2,$3,$4,$5,$6)
+        `INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,codigo,registrado_por)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (adolescente_id,data)
-         DO UPDATE SET status=$4, motivo=$5, registrado_por=$6, turma_id=$2`,
-        [f.adolescente_id, f.turma_id || null, f.data, f.status, f.motivo || null, f.registrado_por || null]
+         DO UPDATE SET status=$4, motivo=$5, codigo=$6, registrado_por=$7, turma_id=$2`,
+        [f.adolescente_id, f.turma_id || null, f.data, f.status, f.motivo || null, f.codigo || null, f.registrado_por || null]
       );
       nFreq++;
     }
@@ -643,8 +658,8 @@ app.get('/api/frequencia/:data', auth, async (req,res) => {
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/frequencia', auth, async (req,res) => {
-  const { adolescente_id,turma_id,data,status,motivo,registrado_por } = req.body;
-  const r = await pool.query('INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (adolescente_id,data) DO UPDATE SET status=$4,motivo=$5,registrado_por=$6 RETURNING *',[adolescente_id,turma_id||null,data,status,motivo||null,registrado_por||null]);
+  const { adolescente_id,turma_id,data,status,motivo,codigo,registrado_por } = req.body;
+  const r = await pool.query('INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,codigo,registrado_por) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (adolescente_id,data) DO UPDATE SET status=$4,motivo=$5,codigo=$6,registrado_por=$7 RETURNING *',[adolescente_id,turma_id||null,data,status,motivo||null,codigo||null,registrado_por||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.post('/api/frequencia/controle-aula', auth, async (req,res) => {
@@ -736,17 +751,38 @@ app.delete('/api/rios/:id', auth, async (req,res) => {
 });
 
 app.post('/api/plantao/troca', auth, async (req,res) => {
-  const { adolescente_id,modulo_destino_id,modulo_origem,modulo_destino,motivo,agente,observacao,data } = req.body;
+  const { adolescente_id,modulo_destino_id,modulo_origem,modulo_destino,motivo,agente,observacao,data,alojamento_origem,alojamento_destino,hora } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('INSERT INTO historico_alojamentos (adolescente_id,modulo_origem,modulo_destino,motivo,agente,observacao,data) VALUES ($1,$2,$3,$4,$5,$6,$7)',[adolescente_id,modulo_origem,modulo_destino,motivo,agente||null,observacao||null,data||new Date().toISOString().slice(0,10)]);
+    await client.query(
+      `INSERT INTO historico_alojamentos
+        (adolescente_id,modulo_origem,modulo_destino,motivo,agente,observacao,data,alojamento_origem,alojamento_destino,hora)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [adolescente_id,modulo_origem,modulo_destino,motivo,agente||null,observacao||null,
+       data||new Date().toISOString().slice(0,10),alojamento_origem||null,alojamento_destino||null,hora||null]);
     await client.query('UPDATE adolescentes SET modulo_id=$1,atualizado_em=NOW() WHERE id=$2',[modulo_destino_id,adolescente_id]);
     await client.query('COMMIT');
     res.json({ ok:true });
   } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ ok:false, erro:e.message }); }
   finally { client.release(); }
 });
+// Trocas de um PERÍODO — precisa vir antes de '/api/plantao/trocas/:data',
+// senão o Express casa "periodo" como se fosse uma data.
+// Até agora as trocas eram gravadas no servidor mas NUNCA lidas de volta:
+// quem abrisse o sistema em outro computador não via troca nenhuma.
+app.get('/api/plantao/trocas/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const r = await pool.query(
+    `SELECT h.*, a.nome as adolescente_nome
+       FROM historico_alojamentos h
+       JOIN adolescentes a ON h.adolescente_id=a.id
+      WHERE h.data >= $1 AND h.data <= $2
+      ORDER BY h.data, h.criado_em`, [inicio, fim]);
+  res.json({ ok:true, dados:r.rows });
+});
+
 app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
