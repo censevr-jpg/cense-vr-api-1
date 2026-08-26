@@ -32,7 +32,53 @@ app.options('*', cors(corsOptions));
 // Helmet depois do CORS
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
-app.use(rateLimit({ windowMs: 15 * 60 * 10000, max: 10000 }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 10000 }));
+
+// ===================================================================
+// BLINDAGEM CONTRA QUEDA DO SERVIDOR (2026-08-25)
+// A maioria das rotas abaixo faz "await pool.query(...)" sem try/catch.
+// Numa rota async do Express, se essa promise rejeitar (erro de SQL,
+// violação de constraint, conexão caindo, etc.), o erro NÃO vira uma
+// resposta HTTP — ele vira uma "unhandled promise rejection" solta no
+// processo Node. A partir do Node 15, isso DERRUBA o processo inteiro na
+// hora. O Render reinicia sozinho, mas leva alguns segundos — e nesse
+// intervalo toda requisição bate num erro 502 do próprio Render, que não
+// tem cabeçalho CORS, e por isso aparece no navegador como "bloqueado por
+// política de CORS" mesmo o problema não sendo CORS nenhum. Foi isso que
+// causou os erros de login e de importação em massa: uma única linha com
+// problema (nome duplicado, dado inesperado, etc.) no meio de várias
+// chamadas em sequência derrubava o servidor pra todo mundo.
+//
+// Em vez de reescrever rota por rota, isso aqui envolve toda rota
+// registrada com app.get/post/put/delete/patch: se o handler (mesmo sem
+// try/catch) rejeitar, a resposta vira um 500 normal em vez de derrubar o
+// servidor. As rotas que já tinham try/catch continuam funcionando igual.
+['get','post','put','delete','patch'].forEach(metodo => {
+  const original = app[metodo].bind(app);
+  app[metodo] = (caminho, ...handlers) => {
+    const seguros = handlers.map(h => {
+      if (typeof h !== 'function') return h;
+      return (req, res, next) => {
+        Promise.resolve(h(req, res, next)).catch(e => {
+          console.error(`Erro em ${metodo.toUpperCase()} ${caminho}:`, e);
+          if (!res.headersSent) res.status(500).json({ ok:false, erro: e.message || 'Erro interno' });
+        });
+      };
+    });
+    return original(caminho, ...seguros);
+  };
+});
+
+// Rede de segurança final: se algo ainda assim escapar (fora de uma rota
+// Express), loga em vez de derrubar o processo. Não interfere no
+// initDB().catch(...) lá embaixo, que já trata seu próprio erro de
+// inicialização.
+process.on('unhandledRejection', (motivo) => {
+  console.error('Unhandled Rejection (servidor continua no ar):', motivo);
+});
+process.on('uncaughtException', (erro) => {
+  console.error('Uncaught Exception (servidor continua no ar):', erro);
+});
 
 function parseDate(d){
   if(!d||d===''||d==='null'||d==='undefined') return null;
@@ -67,7 +113,7 @@ async function initDB() {
       nascimento DATE, modulo_id INTEGER REFERENCES modulos(id),
       turma_id INTEGER REFERENCES turmas(id), cidade VARCHAR(100),
       entrada DATE, situacao VARCHAR(30) DEFAULT 'ativo', tv BOOLEAN DEFAULT false,
-      alojamento VARCHAR(20), atualizado_em TIMESTAMP DEFAULT NOW()
+      alojamento VARCHAR(20), tipo_desligamento VARCHAR(30), atualizado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS historico_alojamentos (
       id SERIAL PRIMARY KEY, adolescente_id INTEGER REFERENCES adolescentes(id),
@@ -131,6 +177,16 @@ async function initDB() {
       id SERIAL PRIMARY KEY, usuario VARCHAR(200), acao VARCHAR(100),
       criado_em TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS cursos (
+      id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL,
+      horario VARCHAR(100), dias VARCHAR(100), turno VARCHAR(20),
+      parceiro VARCHAR(200), ativo BOOLEAN DEFAULT true
+    );
+    CREATE TABLE IF NOT EXISTS adolescente_cursos (
+      adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
+      curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
+      PRIMARY KEY (adolescente_id, curso_id)
+    );
     CREATE TABLE IF NOT EXISTS atendimentos (
       id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
       adolescente_id INTEGER REFERENCES adolescentes(id),
@@ -155,12 +211,29 @@ function auth(req, res, next) {
   catch { res.status(401).json({ ok: false, erro: 'Token invalido' }); }
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+// A 'versao' serve para conferir, sem adivinhacao, se o server.js que
+// esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
+// servidor publicado e antigo — e rotas novas como
+// /api/frequencia/periodo nao existem la, o que derruba o processo.
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.10', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
+    await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS tipo_desligamento VARCHAR(30)");
     await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
+    // Cursos e a matricula do adolescente em cursos — antes existiam
+    // SOMENTE no navegador de quem cadastrava, nunca no banco.
+    await pool.query(`CREATE TABLE IF NOT EXISTS cursos (
+      id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL,
+      horario VARCHAR(100), dias VARCHAR(100), turno VARCHAR(20),
+      parceiro VARCHAR(200), ativo BOOLEAN DEFAULT true
+    )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS adolescente_cursos (
+      adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
+      curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
+      PRIMARY KEY (adolescente_id, curso_id)
+    )`);
     await pool.query(`CREATE TABLE IF NOT EXISTS atendimentos (
       id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
       adolescente_id INTEGER, adolescente_nome VARCHAR(200), data DATE NOT NULL,
@@ -289,6 +362,64 @@ app.delete('/api/config/turmas/:id', auth, async (req,res) => {
   await pool.query('UPDATE turmas SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
+// ===================================================================
+// CURSOS — antes viviam SÓ no localStorage do navegador de quem
+// cadastrava. Quem lançasse um curso no computador do serviço não via
+// nada em casa, porque nunca chegava ao banco. Mesmo padrão que já
+// aconteceu com escolas, turmas, adolescentes e frequência.
+// 'dias' é guardado como texto separado por vírgula (ex.: "seg,qua").
+// ===================================================================
+app.get('/api/config/cursos', auth, async (req,res) => {
+  const r = await pool.query('SELECT * FROM cursos WHERE ativo=true ORDER BY nome');
+  res.json({ ok:true, dados:r.rows });
+});
+app.post('/api/config/cursos', auth, async (req,res) => {
+  const { nome, horario, dias, turno, parceiro } = req.body;
+  const diasTexto = Array.isArray(dias) ? dias.join(',') : (dias || null);
+  const r = await pool.query(
+    'INSERT INTO cursos (nome,horario,dias,turno,parceiro) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [nome, horario||null, diasTexto, turno||null, parceiro||null]
+  );
+  res.json({ ok:true, dados:r.rows[0] });
+});
+app.put('/api/config/cursos/:id', auth, async (req,res) => {
+  const { nome, horario, dias, turno, parceiro } = req.body;
+  const diasTexto = Array.isArray(dias) ? dias.join(',') : (dias || null);
+  const r = await pool.query(
+    'UPDATE cursos SET nome=$1,horario=$2,dias=$3,turno=$4,parceiro=$5 WHERE id=$6 RETURNING *',
+    [nome, horario||null, diasTexto, turno||null, parceiro||null, req.params.id]
+  );
+  res.json({ ok:true, dados:r.rows[0] });
+});
+app.delete('/api/config/cursos/:id', auth, async (req,res) => {
+  // Desativa o curso e desfaz as matrículas — o mesmo que a tela já fazia
+  // localmente ("Adolescentes matriculados perderão a vinculação").
+  await pool.query('DELETE FROM adolescente_cursos WHERE curso_id=$1',[req.params.id]);
+  await pool.query('UPDATE cursos SET ativo=false WHERE id=$1',[req.params.id]);
+  res.json({ ok:true });
+});
+
+// Matrícula do adolescente em cursos — substitui a lista inteira dele.
+app.put('/api/adolescentes/:id/cursos', auth, async (req,res) => {
+  const ids = Array.isArray(req.body.cursos) ? req.body.cursos.filter(x=>x) : [];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM adolescente_cursos WHERE adolescente_id=$1',[req.params.id]);
+    for (const cid of ids) {
+      await client.query(
+        'INSERT INTO adolescente_cursos (adolescente_id,curso_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+        [req.params.id, cid]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, total:ids.length });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally { client.release(); }
+});
+
 app.get('/api/config/produtos', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM produtos WHERE ativo=true ORDER BY nome');
   res.json({ ok:true, dados:r.rows });
@@ -303,22 +434,69 @@ app.delete('/api/config/produtos/:id', auth, async (req,res) => {
 });
 
 app.get('/api/adolescentes', auth, async (req,res) => {
-  const r = await pool.query('SELECT a.*,m.nome as modulo_nome,t.nome as turma_nome,e.nome as escola_nome FROM adolescentes a LEFT JOIN modulos m ON a.modulo_id=m.id LEFT JOIN turmas t ON a.turma_id=t.id LEFT JOIN escolas e ON t.escola_id=e.id ORDER BY a.nome');
+  // cursos_ids vem agregado aqui para que o app monte a lista de cursos de
+  // cada adolescente sem precisar de uma chamada por pessoa.
+  const r = await pool.query(`
+    SELECT a.*, m.nome as modulo_nome, t.nome as turma_nome, e.nome as escola_nome,
+      COALESCE(
+        (SELECT array_agg(ac.curso_id) FROM adolescente_cursos ac WHERE ac.adolescente_id = a.id),
+        '{}'
+      ) AS cursos_ids
+    FROM adolescentes a
+    LEFT JOIN modulos m ON a.modulo_id=m.id
+    LEFT JOIN turmas t ON a.turma_id=t.id
+    LEFT JOIN escolas e ON t.escola_id=e.id
+    ORDER BY a.nome`);
   res.json({ ok:true, dados:r.rows });
 });
 app.post('/api/adolescentes', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento } = req.body;
-  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null]);
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento } = req.body;
+  const r = await pool.query('INSERT INTO adolescentes (nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.put('/api/adolescentes/:id', auth, async (req,res) => {
-  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento } = req.body;
-  const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,alojamento=$10,atualizado_em=NOW() WHERE id=$11 RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,req.params.id]);
+  const { nome,prontuario,nascimento,modulo_id,turma_id,cidade,entrada,situacao,tv,alojamento,tipo_desligamento } = req.body;
+  const r = await pool.query('UPDATE adolescentes SET nome=$1,prontuario=$2,nascimento=$3,modulo_id=$4,turma_id=$5,cidade=$6,entrada=$7,situacao=$8,tv=$9,alojamento=$10,tipo_desligamento=$11,atualizado_em=NOW() WHERE id=$12 RETURNING *',[nome,prontuario||null,parseDate(nascimento),modulo_id||null,turma_id||null,cidade||null,parseDate(entrada),situacao||'ativo',tv||false,alojamento||null,tipo_desligamento||null,req.params.id]);
   res.json({ ok:true, dados:r.rows[0] });
 });
 app.delete('/api/adolescentes/:id', auth, async (req,res) => {
   await pool.query("UPDATE adolescentes SET situacao='desligado' WHERE id=$1",[req.params.id]);
   res.json({ ok:true });
+});
+// Exclusão DEFINITIVA — apaga o cadastro de verdade (nome, frequência,
+// histórico de alojamento, vínculos com agenda/RIO). Diferente do DELETE
+// acima, que só marca como desligado. Serve só para corrigir cadastro
+// duplicado ou lançado por engano — e não para desligamento normal.
+// Restrito a gestor, e roda em transação porque adolescente tem várias
+// tabelas dependentes sem ON DELETE CASCADE (frequencia, historico_
+// alojamentos, agenda_adolescentes, rio_adolescentes) — sem apagar essas
+// linhas primeiro, o DELETE final quebraria por violação de FK.
+app.delete('/api/adolescentes/:id/definitivo', auth, async (req,res) => {
+  if (req.usuario.perfil !== 'gestor') {
+    return res.status(403).json({ ok:false, erro:'Somente o gestor pode excluir definitivamente.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const id = req.params.id;
+    await client.query('DELETE FROM historico_alojamentos WHERE adolescente_id=$1',[id]);
+    await client.query('DELETE FROM frequencia WHERE adolescente_id=$1',[id]);
+    await client.query('DELETE FROM agenda_adolescentes WHERE adolescente_id=$1',[id]);
+    await client.query('DELETE FROM rio_adolescentes WHERE adolescente_id=$1',[id]);
+    // Atendimentos (prontuário técnico/saúde) não é apagado — só desvincula
+    // o adolescente_id, porque o registro do atendimento em si deve
+    // continuar existindo mesmo se o cadastro for excluído.
+    await client.query('UPDATE atendimentos SET adolescente_id=NULL WHERE adolescente_id=$1',[id]);
+    const r = await client.query('DELETE FROM adolescentes WHERE id=$1 RETURNING nome',[id]);
+    await client.query('COMMIT');
+    if (!r.rows.length) return res.status(404).json({ ok:false, erro:'Adolescente nao encontrado.' });
+    res.json({ ok:true, nome:r.rows[0].nome });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally {
+    client.release();
+  }
 });
 app.get('/api/adolescentes/:id/historico', auth, async (req,res) => {
   const r = await pool.query('SELECT * FROM historico_alojamentos WHERE adolescente_id=$1 ORDER BY criado_em DESC',[req.params.id]);
@@ -327,6 +505,86 @@ app.get('/api/adolescentes/:id/historico', auth, async (req,res) => {
 app.get('/api/adolescentes/:id/rios', auth, async (req,res) => {
   const r = await pool.query('SELECT r.* FROM rios r JOIN rio_adolescentes ra ON r.id=ra.rio_id WHERE ra.adolescente_id=$1 ORDER BY r.data DESC',[req.params.id]);
   res.json({ ok:true, dados:r.rows });
+});
+
+// ===================================================================
+// FREQUENCIA POR PERIODO (leitura) — precisa vir ANTES de
+// '/api/frequencia/:data', senao o Express casa "periodo" como se fosse
+// uma data e essa rota nunca e alcancada.
+//
+// Ate agora a frequencia era GRAVADA no servidor mas NUNCA LIDA de volta:
+// carregarDadosAPI() nao buscava frequencia nenhuma, entao a chamada so
+// existia no localStorage do navegador onde foi marcada. Quem abrisse o
+// sistema em outro computador (ou depois de limpar o cache) via tudo em
+// branco, como se nada tivesse sido lancado. Esta rota devolve, de uma vez
+// so, tudo que o periodo tem: frequencia, controle de aula por escola e
+// cancelamento de turma.
+// ===================================================================
+app.get('/api/frequencia/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const f = await pool.query(
+    'SELECT adolescente_id, turma_id, data, status, motivo, registrado_por FROM frequencia WHERE data >= $1 AND data <= $2 ORDER BY data',
+    [inicio, fim]
+  );
+  const c = await pool.query(
+    'SELECT escola_id, data, haula, motivo_sem_aula FROM controle_aula WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  const ct = await pool.query(
+    'SELECT turma_id, data, cancelada, motivo FROM cancelamento_turma WHERE data >= $1 AND data <= $2',
+    [inicio, fim]
+  );
+  res.json({ ok:true, frequencia:f.rows, controles:c.rows, cancelamentos:ct.rows });
+});
+
+// Gravacao EM LOTE — usada pela restauracao de backup. Mandar 600+
+// requisicoes uma a uma demora minutos e qualquer queda no meio deixa a
+// restauracao pela metade sem ninguem saber onde parou; aqui tudo entra
+// numa transacao so: ou grava tudo, ou nao grava nada.
+app.post('/api/frequencia/lote', auth, async (req,res) => {
+  const { frequencia = [], controles = [], cancelamentos = [] } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let nFreq = 0, nCtrl = 0, nCanc = 0;
+    for (const f of frequencia) {
+      if (!f || !f.adolescente_id || !f.data || !f.status) continue;
+      await client.query(
+        `INSERT INTO frequencia (adolescente_id,turma_id,data,status,motivo,registrado_por)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (adolescente_id,data)
+         DO UPDATE SET status=$4, motivo=$5, registrado_por=$6, turma_id=$2`,
+        [f.adolescente_id, f.turma_id || null, f.data, f.status, f.motivo || null, f.registrado_por || null]
+      );
+      nFreq++;
+    }
+    for (const c of controles) {
+      if (!c || !c.escola_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO controle_aula (escola_id,data,haula,motivo_sem_aula) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (escola_id,data) DO UPDATE SET haula=$3, motivo_sem_aula=$4`,
+        [c.escola_id, c.data, c.haula !== false, c.motivo_sem_aula || null]
+      );
+      nCtrl++;
+    }
+    for (const c of cancelamentos) {
+      if (!c || !c.turma_id || !c.data) continue;
+      await client.query(
+        `INSERT INTO cancelamento_turma (turma_id,data,cancelada,motivo) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (turma_id,data) DO UPDATE SET cancelada=$3, motivo=$4`,
+        [c.turma_id, c.data, c.cancelada !== false, c.motivo || null]
+      );
+      nCanc++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, frequencia:nFreq, controles:nCtrl, cancelamentos:nCanc });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/frequencia/:data', auth, async (req,res) => {
@@ -367,7 +625,9 @@ app.post('/api/agenda', auth, async (req,res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const r = await client.query('INSERT INTO agenda (data,hora,tipo,carater,modalidade,escolta,viatura,observacao,registrado_por) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[data,hora,tipo,carater||'Externa',modalidade||'Presencial',escolta||null,viatura||null,observacao||null,registrado_por||null]);
+    // Usar nome do usuário autenticado se não vier registrado_por
+    const nomeRegistrador = registrado_por || req.usuario?.nome || 'Sistema';
+    const r = await client.query('INSERT INTO agenda (data,hora,tipo,carater,modalidade,escolta,viatura,observacao,registrado_por) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[data,hora,tipo,carater||'Externa',modalidade||'Presencial',escolta||null,viatura||null,observacao||null,nomeRegistrador]);
     if (adolescentes && adolescentes.length) {
       for (const aid of adolescentes) await client.query('INSERT INTO agenda_adolescentes (agenda_id,adolescente_id) VALUES ($1,$2)',[r.rows[0].id,aid]);
     }
