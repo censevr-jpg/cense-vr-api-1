@@ -177,6 +177,10 @@ async function initDB() {
       id SERIAL PRIMARY KEY, usuario VARCHAR(200), acao VARCHAR(100),
       criado_em TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS configuracoes (
+      chave VARCHAR(100) PRIMARY KEY, valor JSONB NOT NULL,
+      atualizado_em TIMESTAMP DEFAULT NOW(), atualizado_por VARCHAR(200)
+    );
     CREATE TABLE IF NOT EXISTS cursos (
       id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL,
       horario VARCHAR(100), dias VARCHAR(100), turno VARCHAR(20),
@@ -215,13 +219,17 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.10', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.11', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 app.get('/migrate', async (req, res) => {
   try {
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
     await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS tipo_desligamento VARCHAR(30)");
     await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS configuracoes (
+      chave VARCHAR(100) PRIMARY KEY, valor JSONB NOT NULL,
+      atualizado_em TIMESTAMP DEFAULT NOW(), atualizado_por VARCHAR(200)
+    )`);
     // Cursos e a matricula do adolescente em cursos — antes existiam
     // SOMENTE no navegador de quem cadastrava, nunca no banco.
     await pool.query(`CREATE TABLE IF NOT EXISTS cursos (
@@ -362,6 +370,29 @@ app.delete('/api/config/turmas/:id', auth, async (req,res) => {
   await pool.query('UPDATE turmas SET ativo=false WHERE id=$1',[req.params.id]);
   res.json({ ok:true });
 });
+// ===================================================================
+// CONFIGURAÇÕES GERAIS — guarda no banco os ajustes que antes viviam só
+// no navegador (escala de banho de sol, escala da quadra, e o que mais
+// vier). Cada ajuste é uma chave com um valor em JSON, então dá para
+// acrescentar novos sem mexer no banco de novo.
+// ===================================================================
+app.get('/api/config/gerais', auth, async (req,res) => {
+  const r = await pool.query('SELECT chave, valor FROM configuracoes');
+  const dados = {};
+  r.rows.forEach(l => { dados[l.chave] = l.valor; });
+  res.json({ ok:true, dados });
+});
+app.put('/api/config/gerais/:chave', auth, async (req,res) => {
+  const valor = req.body && req.body.valor !== undefined ? req.body.valor : null;
+  if (valor === null) return res.status(400).json({ ok:false, erro:'Informe "valor".' });
+  await pool.query(
+    `INSERT INTO configuracoes (chave,valor,atualizado_em,atualizado_por) VALUES ($1,$2,NOW(),$3)
+     ON CONFLICT (chave) DO UPDATE SET valor=$2, atualizado_em=NOW(), atualizado_por=$3`,
+    [req.params.chave, JSON.stringify(valor), (req.usuario && req.usuario.nome) || null]
+  );
+  res.json({ ok:true });
+});
+
 // ===================================================================
 // CURSOS — antes viviam SÓ no localStorage do navegador de quem
 // cadastrava. Quem lançasse um curso no computador do serviço não via
