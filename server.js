@@ -241,30 +241,136 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.26', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.27', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
-// Uma lista so de colunas que foram acrescentadas depois da criacao das
-// tabelas. Usada pelo initDB (no arranque) e pelo /migrate (manual), para
-// as duas nunca sairem de sincronia — que foi como a coluna matricula
-// acabou existindo so em quem tinha rodado o /migrate.
+// ===================================================================
+// RECONCILIACAO DE COLUNAS
+//
+// O problema, que ja mordeu tres vezes: CREATE TABLE IF NOT EXISTS NAO
+// acrescenta coluna em tabela que ja existe. Quando o codigo ganha um
+// campo novo, o banco de producao continua sem ele, e a rota quebra com
+// "column X does not exist" — mas so na hora em que alguem usa. Foi
+// assim com `matricula`, com `criado_em` e com `adolescente_nome`.
+//
+// Remendar coluna por coluna, do jeito que eu vinha fazendo, so adia o
+// proximo susto. Aqui a lista abaixo e a VERDADE do que o codigo espera,
+// e no arranque o servidor acrescenta o que estiver faltando em qualquer
+// tabela. Nenhuma coluna e removida nem alterada: so acrescentada.
+//
+// REGRA PARA O FUTURO: campo novo entra NESTA lista, alem do CREATE TABLE.
+// ===================================================================
+const COLUNAS_ESPERADAS = {
+  usuarios: {
+    nome:"VARCHAR(200)", senha_hash:"VARCHAR(200)", perfil:"VARCHAR(50) DEFAULT 'agente'",
+    matricula:"VARCHAR(50)", ativo:"BOOLEAN DEFAULT true", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  modulos: { nome:"VARCHAR(100)", ativo:"BOOLEAN DEFAULT true" },
+  escolas: { nome:"VARCHAR(200)", ativo:"BOOLEAN DEFAULT true" },
+  turmas:  { escola_id:"INTEGER", nome:"VARCHAR(200)", ativo:"BOOLEAN DEFAULT true" },
+  adolescentes: {
+    nome:"VARCHAR(200)", prontuario:"VARCHAR(50)", nascimento:"DATE", modulo_id:"INTEGER",
+    turma_id:"INTEGER", cidade:"VARCHAR(100)", entrada:"DATE",
+    situacao:"VARCHAR(30) DEFAULT 'ativo'", tv:"BOOLEAN DEFAULT false",
+    alojamento:"VARCHAR(20)", tipo_desligamento:"VARCHAR(30)",
+    rg:"VARCHAR(40)", cpf:"VARCHAR(30)", mae_nome:"VARCHAR(200)",
+    atualizado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  historico_alojamentos: {
+    adolescente_id:"INTEGER", modulo_origem:"VARCHAR(100)", modulo_destino:"VARCHAR(100)",
+    motivo:"TEXT", agente:"VARCHAR(200)", observacao:"TEXT", data:"DATE DEFAULT CURRENT_DATE",
+    alojamento_origem:"VARCHAR(20)", alojamento_destino:"VARCHAR(20)", hora:"VARCHAR(10)",
+    criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  frequencia: {
+    adolescente_id:"INTEGER", turma_id:"INTEGER", data:"DATE",
+    status:"VARCHAR(20) DEFAULT 'nao_registrado'", motivo:"TEXT",
+    registrado_por:"VARCHAR(200)", codigo:"VARCHAR(5)", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  frequencia_curso: {
+    curso_id:"INTEGER", adolescente_id:"INTEGER", data:"DATE", status:"VARCHAR(20)",
+    motivo:"TEXT", codigo:"VARCHAR(5)", registrado_por:"VARCHAR(200)",
+    atualizado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  controle_aula: { escola_id:"INTEGER", data:"DATE", haula:"BOOLEAN DEFAULT true", motivo_sem_aula:"VARCHAR(200)" },
+  cancelamento_turma: { turma_id:"INTEGER", data:"DATE", cancelada:"BOOLEAN DEFAULT false", motivo:"VARCHAR(200)" },
+  agenda: {
+    data:"DATE", hora:"TIME", tipo:"VARCHAR(100)", carater:"VARCHAR(20) DEFAULT 'Externa'",
+    modalidade:"VARCHAR(20) DEFAULT 'Presencial'", escolta:"VARCHAR(200)", viatura:"VARCHAR(50)",
+    observacao:"TEXT", registrado_por:"VARCHAR(200)", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  produtos: { nome:"VARCHAR(200)", unidade:"VARCHAR(50)", ativo:"BOOLEAN DEFAULT true" },
+  entregas: {
+    data:"DATE", hora:"TIME DEFAULT CURRENT_TIME", destinatario_id:"INTEGER",
+    destinatario_nome:"VARCHAR(200)", modulo:"VARCHAR(100)", produtos:"TEXT",
+    observacao:"TEXT", operador:"VARCHAR(200)", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  rios: {
+    numero:"INTEGER", data:"DATE", plantao:"VARCHAR(5)", local:"VARCHAR(200)",
+    comunicante:"VARCHAR(200)", coord:"VARCHAR(200)", infracao:"VARCHAR(20)", descricao:"TEXT",
+    cautelar:"VARCHAR(5) DEFAULT 'NAO'", medida:"TEXT",
+    encaminhado_cad:"BOOLEAN DEFAULT false", encaminhado_cad_em:"TIMESTAMP",
+    encaminhado_cad_por:"VARCHAR(200)", registrado_por:"VARCHAR(200)",
+    criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  cursos: {
+    nome:"VARCHAR(200)", horario:"VARCHAR(100)", dias:"VARCHAR(100)",
+    turno:"VARCHAR(20)", parceiro:"VARCHAR(200)", ativo:"BOOLEAN DEFAULT true"
+  },
+  atendimentos: {
+    profissional:"VARCHAR(200)", area:"VARCHAR(100)", adolescente_id:"INTEGER",
+    adolescente_nome:"VARCHAR(200)", data:"DATE", hora:"TIME", tipo:"VARCHAR(200)",
+    saude_mental:"BOOLEAN DEFAULT false", obs:"TEXT", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  log_acesso: { usuario:"VARCHAR(200)", acao:"VARCHAR(100)", criado_em:"TIMESTAMP DEFAULT NOW()" },
+  configuracoes: { valor:"JSONB", atualizado_em:"TIMESTAMP DEFAULT NOW()", atualizado_por:"VARCHAR(200)" }
+};
+
+// Acrescenta o que faltar. Devolve a lista do que foi criado, para o log
+// e para o endereco /verificar-colunas.
 async function _alinharColunas(){
-  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
-  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS tipo_desligamento VARCHAR(30)");
-  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
-  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS rg VARCHAR(40)");
-  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS cpf VARCHAR(30)");
-  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS mae_nome VARCHAR(200)");
-  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_origem VARCHAR(20)");
-  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_destino VARCHAR(20)");
-  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS hora VARCHAR(10)");
-  await pool.query("ALTER TABLE frequencia ADD COLUMN IF NOT EXISTS codigo VARCHAR(5)");
-  // A tabela `atendimentos` em producao foi criada antes de `criado_em`
-  // existir, e CREATE TABLE IF NOT EXISTS nao acrescenta coluna em tabela
-  // que ja existe. A trava anti-duplicata da 12.23 consultava essa coluna
-  // e quebrava com "column criado_em does not exist" — derrubando TODA
-  // gravacao de atendimento, inclusive a importacao da planilha.
-  await pool.query("ALTER TABLE atendimentos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()");
+  const criadas = [];
+  for (const tabela of Object.keys(COLUNAS_ESPERADAS)) {
+    let existe;
+    try {
+      existe = await pool.query(
+        'SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1',
+        [tabela]
+      );
+    } catch(e) { continue; }
+    if (!existe.rows.length) continue;               // tabela ainda nao existe: o CREATE cuida
+    const tem = new Set(existe.rows.map(r => r.column_name));
+    for (const [coluna, tipo] of Object.entries(COLUNAS_ESPERADAS[tabela])) {
+      if (tem.has(coluna)) continue;
+      try {
+        await pool.query(`ALTER TABLE ${tabela} ADD COLUMN IF NOT EXISTS ${coluna} ${tipo}`);
+        criadas.push(tabela + '.' + coluna);
+      } catch(e) {
+        console.error('Nao consegui criar ' + tabela + '.' + coluna + ':', e.message);
+      }
+    }
+  }
+  if (criadas.length) console.log('Colunas acrescentadas: ' + criadas.join(', '));
+  else console.log('Colunas: nada faltando.');
+  return criadas;
 }
+
+// Diagnostico: mostra o que esta faltando SEM alterar nada.
+app.get('/verificar-colunas', async (req, res) => {
+  try {
+    const faltando = {};
+    for (const tabela of Object.keys(COLUNAS_ESPERADAS)) {
+      const r = await pool.query(
+        'SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1',
+        [tabela]
+      );
+      if (!r.rows.length) { faltando[tabela] = 'TABELA NAO EXISTE'; continue; }
+      const tem = new Set(r.rows.map(x => x.column_name));
+      const f = Object.keys(COLUNAS_ESPERADAS[tabela]).filter(c => !tem.has(c));
+      if (f.length) faltando[tabela] = f;
+    }
+    res.json({ ok:true, tudoCerto: Object.keys(faltando).length === 0, faltando });
+  } catch(e) { res.json({ ok:false, erro:e.message }); }
+});
 
 app.get('/migrate', async (req, res) => {
   try {
