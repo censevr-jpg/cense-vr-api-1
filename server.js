@@ -241,7 +241,7 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.22', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.23', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 // Uma lista so de colunas que foram acrescentadas depois da criacao das
 // tabelas. Usada pelo initDB (no arranque) e pelo /migrate (manual), para
@@ -890,7 +890,28 @@ app.get('/api/atendimentos', auth, async (req,res) => {
 });
 app.post('/api/atendimentos', auth, async (req,res) => {
   try {
-    const { profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs } = req.body;
+    const { profissional, area, adolescente_id, adolescente_nome, data, hora, tipo, saude_mental, obs, permitir_duplicata } = req.body;
+    // TRAVA CONTRA DUPLICATA. Dois cliques no botao mandam dois POST
+    // iguais; o navegador ja tem a sua propria trava, mas ela nao cobre
+    // dois computadores ao mesmo tempo nem um clique que escapa antes da
+    // tela travar. Se um atendimento identico entrou nos ultimos 2
+    // minutos, devolvemos o que JA existe em vez de criar outro — assim o
+    // app recebe um id valido e nao fica achando que falhou.
+    const dup = await pool.query(
+      `SELECT * FROM atendimentos
+        WHERE profissional=$1 AND data=$2 AND tipo=$3
+          AND COALESCE(adolescente_id,-1)=COALESCE($4,-1)
+          AND criado_em > NOW() - INTERVAL '2 minutes'
+        ORDER BY id DESC LIMIT 1`,
+      [profissional, data, tipo, adolescente_id||null]
+    );
+    // permitir_duplicata: o app manda isto quando a PESSOA ja viu o aviso
+    // "ja existe um lancamento igual" e respondeu que houve mesmo um
+    // segundo atendimento. Sem isto, a trava do servidor impediria um
+    // registro legitimo e a pessoa nao teria como lancar.
+    if (dup.rows.length && !permitir_duplicata) {
+      return res.json({ ok:true, dados:dup.rows[0], duplicado:true });
+    }
     const r = await pool.query(
       'INSERT INTO atendimentos (profissional,area,adolescente_id,adolescente_nome,data,hora,tipo,saude_mental,obs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
       [profissional,area||null,adolescente_id||null,adolescente_nome||null,data,hora||null,tipo,saude_mental||false,obs||null]
