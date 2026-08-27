@@ -197,6 +197,18 @@ async function initDB() {
       curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
       PRIMARY KEY (adolescente_id, curso_id)
     );
+    CREATE TABLE IF NOT EXISTS almox_produtos (
+      id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL,
+      unidade VARCHAR(40) DEFAULT 'un', ativo BOOLEAN DEFAULT true,
+      criado_em TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS almox_movimentacoes (
+      id SERIAL PRIMARY KEY,
+      produto_id INTEGER REFERENCES almox_produtos(id) ON DELETE CASCADE,
+      tipo VARCHAR(10) NOT NULL, quantidade INTEGER NOT NULL,
+      data DATE NOT NULL, responsavel VARCHAR(200), notas TEXT,
+      adolescente_id INTEGER, criado_em TIMESTAMP DEFAULT NOW()
+    );
     CREATE TABLE IF NOT EXISTS frequencia_curso (
       curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
       adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
@@ -241,7 +253,7 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.27', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.29', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 // ===================================================================
 // RECONCILIACAO DE COLUNAS
@@ -315,6 +327,15 @@ const COLUNAS_ESPERADAS = {
   cursos: {
     nome:"VARCHAR(200)", horario:"VARCHAR(100)", dias:"VARCHAR(100)",
     turno:"VARCHAR(20)", parceiro:"VARCHAR(200)", ativo:"BOOLEAN DEFAULT true"
+  },
+  almox_produtos: {
+    nome:"VARCHAR(200)", unidade:"VARCHAR(40) DEFAULT 'un'",
+    ativo:"BOOLEAN DEFAULT true", criado_em:"TIMESTAMP DEFAULT NOW()"
+  },
+  almox_movimentacoes: {
+    produto_id:"INTEGER", tipo:"VARCHAR(10)", quantidade:"INTEGER", data:"DATE",
+    responsavel:"VARCHAR(200)", notas:"TEXT", adolescente_id:"INTEGER",
+    criado_em:"TIMESTAMP DEFAULT NOW()"
   },
   atendimentos: {
     profissional:"VARCHAR(200)", area:"VARCHAR(100)", adolescente_id:"INTEGER",
@@ -944,6 +965,106 @@ app.get('/api/plantao/trocas/periodo', auth, async (req,res) => {
 app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
+});
+
+// ===================================================================
+// ALMOXARIFADO
+//
+// Ate agora o almoxarifado vivia SO no navegador: `D.almox_produtos` e
+// `D.almox_estoque` nunca falavam com o servidor, e a rota antiga
+// /api/almoxarifado/entregas jamais foi chamada. Quem lancasse uma
+// entrada num computador nao via nada em outro.
+//
+// DECISAO IMPORTANTE: o saldo NAO e guardado. Ele e SEMPRE calculado a
+// partir das movimentacoes (entradas menos saidas). Guardar o saldo e
+// somar/subtrair em cada maquina faria os numeros divergirem em silencio
+// assim que duas pessoas mexessem ao mesmo tempo — e num almoxarifado
+// isso vira falta de material sem ninguem entender por que.
+// ===================================================================
+app.get('/api/almox/produtos', auth, async (req,res) => {
+  const r = await pool.query(`
+    SELECT p.id, p.nome, p.unidade, p.ativo,
+           COALESCE(SUM(CASE WHEN m.tipo='entrada' THEN m.quantidade
+                             WHEN m.tipo='saida'   THEN -m.quantidade
+                             ELSE 0 END), 0)::int AS saldo
+      FROM almox_produtos p
+      LEFT JOIN almox_movimentacoes m ON m.produto_id = p.id
+     GROUP BY p.id, p.nome, p.unidade, p.ativo
+     ORDER BY p.nome`);
+  res.json({ ok:true, dados:r.rows });
+});
+app.post('/api/almox/produtos', auth, async (req,res) => {
+  const { nome, unidade } = req.body;
+  if (!nome) return res.status(400).json({ ok:false, erro:'Informe o nome do material.' });
+  // Nao duplica material com o mesmo nome: devolve o que ja existe.
+  const ja = await pool.query('SELECT * FROM almox_produtos WHERE LOWER(TRIM(nome))=LOWER(TRIM($1))', [nome]);
+  if (ja.rows.length) return res.json({ ok:true, dados:ja.rows[0], jaExistia:true });
+  const r = await pool.query(
+    'INSERT INTO almox_produtos (nome,unidade) VALUES ($1,$2) RETURNING *',
+    [nome, unidade || 'un']
+  );
+  res.json({ ok:true, dados:r.rows[0] });
+});
+app.put('/api/almox/produtos/:id', auth, async (req,res) => {
+  const { nome, unidade, ativo } = req.body;
+  const r = await pool.query(
+    'UPDATE almox_produtos SET nome=COALESCE($1,nome), unidade=COALESCE($2,unidade), ativo=COALESCE($3,ativo) WHERE id=$4 RETURNING *',
+    [nome||null, unidade||null, (ativo===undefined?null:ativo), req.params.id]
+  );
+  res.json({ ok:true, dados:r.rows[0] });
+});
+app.delete('/api/almox/produtos/:id', auth, async (req,res) => {
+  await pool.query('DELETE FROM almox_produtos WHERE id=$1',[req.params.id]);
+  res.json({ ok:true });
+});
+
+// /periodo ANTES de qualquer /:param
+app.get('/api/almox/movimentacoes/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const r = await pool.query(
+    'SELECT id, produto_id, tipo, quantidade, data, responsavel, notas, adolescente_id FROM almox_movimentacoes WHERE data >= $1 AND data <= $2 ORDER BY data, id',
+    [inicio, fim]
+  );
+  res.json({ ok:true, dados:r.rows });
+});
+app.post('/api/almox/movimentacoes', auth, async (req,res) => {
+  const { produto_id, tipo, quantidade, data, responsavel, notas, adolescente_id } = req.body;
+  if (!produto_id || !tipo || !quantidade || !data)
+    return res.status(400).json({ ok:false, erro:'Informe produto_id, tipo, quantidade e data.' });
+  if (tipo !== 'entrada' && tipo !== 'saida')
+    return res.status(400).json({ ok:false, erro:'tipo deve ser "entrada" ou "saida".' });
+  const r = await pool.query(
+    'INSERT INTO almox_movimentacoes (produto_id,tipo,quantidade,data,responsavel,notas,adolescente_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+    [produto_id, tipo, Math.abs(parseInt(quantidade,10)), data, responsavel||null, notas||null, adolescente_id||null]
+  );
+  res.json({ ok:true, dados:r.rows[0] });
+});
+app.delete('/api/almox/movimentacoes/:id', auth, async (req,res) => {
+  await pool.query('DELETE FROM almox_movimentacoes WHERE id=$1',[req.params.id]);
+  res.json({ ok:true });
+});
+// Lote, para a carga inicial dos pedidos do almoxarifado virtual.
+app.post('/api/almox/movimentacoes/lote', auth, async (req,res) => {
+  const { movimentacoes = [] } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let n = 0;
+    for (const m of movimentacoes) {
+      if (!m || !m.produto_id || !m.tipo || !m.quantidade || !m.data) continue;
+      await client.query(
+        'INSERT INTO almox_movimentacoes (produto_id,tipo,quantidade,data,responsavel,notas,adolescente_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [m.produto_id, m.tipo, Math.abs(parseInt(m.quantidade,10)), m.data, m.responsavel||null, m.notas||null, m.adolescente_id||null]
+      );
+      n++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, gravadas:n });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally { client.release(); }
 });
 
 // ===================================================================
