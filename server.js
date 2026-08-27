@@ -241,7 +241,7 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.23', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.26', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 // Uma lista so de colunas que foram acrescentadas depois da criacao das
 // tabelas. Usada pelo initDB (no arranque) e pelo /migrate (manual), para
@@ -258,6 +258,12 @@ async function _alinharColunas(){
   await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_destino VARCHAR(20)");
   await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS hora VARCHAR(10)");
   await pool.query("ALTER TABLE frequencia ADD COLUMN IF NOT EXISTS codigo VARCHAR(5)");
+  // A tabela `atendimentos` em producao foi criada antes de `criado_em`
+  // existir, e CREATE TABLE IF NOT EXISTS nao acrescenta coluna em tabela
+  // que ja existe. A trava anti-duplicata da 12.23 consultava essa coluna
+  // e quebrava com "column criado_em does not exist" — derrubando TODA
+  // gravacao de atendimento, inclusive a importacao da planilha.
+  await pool.query("ALTER TABLE atendimentos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT NOW()");
 }
 
 app.get('/migrate', async (req, res) => {
@@ -897,14 +903,22 @@ app.post('/api/atendimentos', auth, async (req,res) => {
     // tela travar. Se um atendimento identico entrou nos ultimos 2
     // minutos, devolvemos o que JA existe em vez de criar outro — assim o
     // app recebe um id valido e nao fica achando que falhou.
-    const dup = await pool.query(
-      `SELECT * FROM atendimentos
-        WHERE profissional=$1 AND data=$2 AND tipo=$3
-          AND COALESCE(adolescente_id,-1)=COALESCE($4,-1)
-          AND criado_em > NOW() - INTERVAL '2 minutes'
-        ORDER BY id DESC LIMIT 1`,
-      [profissional, data, tipo, adolescente_id||null]
-    );
+    // A consulta da trava NUNCA pode impedir a gravação: se ela falhar
+    // por qualquer motivo, seguimos e gravamos. Antes não era assim, e um
+    // erro aqui (coluna faltando) barrava todo lançamento de atendimento.
+    let dup = { rows: [] };
+    try {
+      dup = await pool.query(
+        `SELECT * FROM atendimentos
+          WHERE profissional=$1 AND data=$2 AND tipo=$3
+            AND COALESCE(adolescente_id,-1)=COALESCE($4,-1)
+            AND criado_em > NOW() - INTERVAL '2 minutes'
+          ORDER BY id DESC LIMIT 1`,
+        [profissional, data, tipo, adolescente_id||null]
+      );
+    } catch(eDup){
+      console.error('Trava anti-duplicata indisponivel, gravando assim mesmo:', eDup.message);
+    }
     // permitir_duplicata: o app manda isto quando a PESSOA ja viu o aviso
     // "ja existe um lancamento igual" e respondeu que houve mesmo um
     // segundo atendimento. Sem isto, a trava do servidor impediria um
