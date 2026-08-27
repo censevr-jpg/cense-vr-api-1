@@ -96,6 +96,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS usuarios (
       id SERIAL PRIMARY KEY, nome VARCHAR(200) NOT NULL,
       senha_hash VARCHAR(200) NOT NULL, perfil VARCHAR(50) DEFAULT 'agente',
+      matricula VARCHAR(50),
       ativo BOOLEAN DEFAULT true, criado_em TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS modulos (
@@ -196,6 +197,14 @@ async function initDB() {
       curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
       PRIMARY KEY (adolescente_id, curso_id)
     );
+    CREATE TABLE IF NOT EXISTS frequencia_curso (
+      curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
+      adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
+      data DATE NOT NULL, status VARCHAR(20) NOT NULL,
+      motivo TEXT, codigo VARCHAR(5), registrado_por VARCHAR(200),
+      atualizado_em TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (curso_id, adolescente_id, data)
+    );
     CREATE TABLE IF NOT EXISTS atendimentos (
       id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
       adolescente_id INTEGER REFERENCES adolescentes(id),
@@ -204,6 +213,14 @@ async function initDB() {
       obs TEXT, criado_em TIMESTAMP DEFAULT NOW()
     );
   `);
+  // As colunas abaixo nasceram depois das tabelas. Ate agora so o
+  // /migrate as criava — e o /migrate e MANUAL. Num banco novo, ou num
+  // banco recriado, o login quebrava na hora ("column matricula does not
+  // exist"), porque a consulta de login usa matricula e a tabela nao
+  // tinha. Rodando as mesmas ALTERs aqui, o servidor sobe completo
+  // sozinho e ninguem depende de lembrar de chamar /migrate.
+  await _alinharColunas();
+
   const existe = await pool.query("SELECT id FROM usuarios WHERE nome='Gestor'");
   if (!existe.rows.length) {
     const hash = await bcrypt.hash('degase2025', 10);
@@ -224,7 +241,24 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.16', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.22', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+
+// Uma lista so de colunas que foram acrescentadas depois da criacao das
+// tabelas. Usada pelo initDB (no arranque) e pelo /migrate (manual), para
+// as duas nunca sairem de sincronia — que foi como a coluna matricula
+// acabou existindo so em quem tinha rodado o /migrate.
+async function _alinharColunas(){
+  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS alojamento VARCHAR(20)");
+  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS tipo_desligamento VARCHAR(30)");
+  await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS matricula VARCHAR(50)");
+  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS rg VARCHAR(40)");
+  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS cpf VARCHAR(30)");
+  await pool.query("ALTER TABLE adolescentes ADD COLUMN IF NOT EXISTS mae_nome VARCHAR(200)");
+  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_origem VARCHAR(20)");
+  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS alojamento_destino VARCHAR(20)");
+  await pool.query("ALTER TABLE historico_alojamentos ADD COLUMN IF NOT EXISTS hora VARCHAR(10)");
+  await pool.query("ALTER TABLE frequencia ADD COLUMN IF NOT EXISTS codigo VARCHAR(5)");
+}
 
 app.get('/migrate', async (req, res) => {
   try {
@@ -265,6 +299,18 @@ app.get('/migrate', async (req, res) => {
       adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
       curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
       PRIMARY KEY (adolescente_id, curso_id)
+    )`);
+    // Frequencia dos CURSOS. Ate agora a chamada do curso so existia no
+    // navegador de quem lancou: gravarDiarioCurso() salvava em
+    // localStorage e nunca falava com o servidor. Mesmo padrao que ja
+    // aconteceu com a frequencia escolar.
+    await pool.query(`CREATE TABLE IF NOT EXISTS frequencia_curso (
+      curso_id INTEGER REFERENCES cursos(id) ON DELETE CASCADE,
+      adolescente_id INTEGER REFERENCES adolescentes(id) ON DELETE CASCADE,
+      data DATE NOT NULL, status VARCHAR(20) NOT NULL,
+      motivo TEXT, codigo VARCHAR(5), registrado_por VARCHAR(200),
+      atualizado_em TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (curso_id, adolescente_id, data)
     )`);
     await pool.query(`CREATE TABLE IF NOT EXISTS atendimentos (
       id SERIAL PRIMARY KEY, profissional VARCHAR(200) NOT NULL, area VARCHAR(100),
@@ -786,6 +832,48 @@ app.get('/api/plantao/trocas/periodo', auth, async (req,res) => {
 app.get('/api/plantao/trocas/:data', auth, async (req,res) => {
   const r = await pool.query('SELECT h.*,a.nome as adolescente_nome FROM historico_alojamentos h JOIN adolescentes a ON h.adolescente_id=a.id WHERE h.data=$1 ORDER BY h.criado_em DESC',[req.params.data]);
   res.json({ ok:true, dados:r.rows });
+});
+
+// ===================================================================
+// FREQUENCIA DOS CURSOS
+// A chamada do curso nunca saia do navegador: gravarDiarioCurso() so
+// chamava S(). Quem lancasse no computador do servico nao via nada em
+// casa, e um cache limpo levava tudo embora.
+// ATENCAO: /periodo tem de vir ANTES de /:curso, senao o Express casa
+// "periodo" como se fosse um id de curso.
+// ===================================================================
+app.get('/api/frequencia-curso/periodo', auth, async (req,res) => {
+  const { inicio, fim } = req.query;
+  if (!inicio || !fim) return res.status(400).json({ ok:false, erro:'Informe inicio e fim (AAAA-MM-DD).' });
+  const r = await pool.query(
+    'SELECT curso_id, adolescente_id, data, status, motivo, codigo, registrado_por FROM frequencia_curso WHERE data >= $1 AND data <= $2 ORDER BY data',
+    [inicio, fim]
+  );
+  res.json({ ok:true, dados:r.rows });
+});
+app.post('/api/frequencia-curso/lote', auth, async (req,res) => {
+  const { frequencia = [] } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let n = 0;
+    for (const f of frequencia) {
+      if (!f || !f.curso_id || !f.adolescente_id || !f.data || !f.status) continue;
+      await client.query(
+        `INSERT INTO frequencia_curso (curso_id,adolescente_id,data,status,motivo,codigo,registrado_por,atualizado_em)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (curso_id,adolescente_id,data)
+         DO UPDATE SET status=$4, motivo=$5, codigo=$6, registrado_por=$7, atualizado_em=NOW()`,
+        [f.curso_id, f.adolescente_id, f.data, f.status, f.motivo || null, f.codigo || null, f.registrado_por || null]
+      );
+      n++;
+    }
+    await client.query('COMMIT');
+    res.json({ ok:true, gravados:n });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ ok:false, erro:e.message });
+  } finally { client.release(); }
 });
 
 app.get('/api/atendimentos', auth, async (req,res) => {
