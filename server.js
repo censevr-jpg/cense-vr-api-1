@@ -253,7 +253,7 @@ function auth(req, res, next) {
 // esta no ar e o mais recente. Se este endereco nao mostrar a versao, o
 // servidor publicado e antigo — e rotas novas como
 // /api/frequencia/periodo nao existem la, o que derruba o processo.
-app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.29', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
+app.get('/health', (req, res) => res.json({ ok: true, status: 'CENSE-VR API', versao: '12.34', time: new Date(), banco: USANDO_SUPABASE ? 'Supabase' : 'Render' }));
 
 // ===================================================================
 // RECONCILIACAO DE COLUNAS
@@ -619,9 +619,20 @@ app.post('/api/config/cursos', auth, async (req,res) => {
 app.put('/api/config/cursos/:id', auth, async (req,res) => {
   const { nome, horario, dias, turno, parceiro } = req.body;
   const diasTexto = Array.isArray(dias) ? dias.join(',') : (dias || null);
+  // COALESCE em tudo: quem manda só um campo (ex.: corrigir o turno pela
+  // tela de Configuracoes) nao pode apagar o nome e os dias do curso.
+  // Mesmo cuidado que ja tomamos em adolescentes com rg/cpf/mae_nome.
+  // 'turno' aceita string vazia de proposito: vazio significa
+  // "contraturno da escola de cada um", que e uma escolha valida.
   const r = await pool.query(
-    'UPDATE cursos SET nome=$1,horario=$2,dias=$3,turno=$4,parceiro=$5 WHERE id=$6 RETURNING *',
-    [nome, horario||null, diasTexto, turno||null, parceiro||null, req.params.id]
+    `UPDATE cursos SET
+       nome     = COALESCE($1, nome),
+       horario  = COALESCE($2, horario),
+       dias     = COALESCE($3, dias),
+       turno    = CASE WHEN $4::text IS NULL THEN turno ELSE NULLIF($4,'') END,
+       parceiro = COALESCE($5, parceiro)
+     WHERE id=$6 RETURNING *`,
+    [nome||null, horario||null, diasTexto, (turno===undefined?null:turno), parceiro||null, req.params.id]
   );
   res.json({ ok:true, dados:r.rows[0] });
 });
